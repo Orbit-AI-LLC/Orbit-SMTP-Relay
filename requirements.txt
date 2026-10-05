@@ -1,0 +1,6 @@
+# The relay agent deliberately has no third-party dependencies.
+#
+# Postfix handles TLS, SPF, DKIM and rate limiting; the agent needs only the
+# standard library to move a file from a directory to an HTTP endpoint and
+# retry it until it lands. Keeping the dependency set empty means a node's
+# image can be rebuilt years from now and still start.

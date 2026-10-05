@@ -1,0 +1,34 @@
+# Local development: the relay against an Orbit Mail dev server on the host.
+#
+# The queue is bind-mounted rather than named so a developer can inspect the
+# JSON files directly; being able to read what the relay is holding is the
+# fastest way to understand why something is not being delivered.
+
+services:
+  relay:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: orbit-relay-dev
+    restart: unless-stopped
+    environment:
+      ORBIT_RELAY_NAME: relay-dev
+      ORBIT_RELAY_HOSTNAME: relay-dev.localhost
+      ORBIT_MAIL_SERVER_URL: http://host.docker.internal:8100
+      # Issue one on http://localhost:8100/admin/relay/ and paste it here.
+      ORBIT_RELAY_API_KEY: ""
+      ORBIT_LOG_BACKEND: memory
+      ORBIT_BACKOFF_BASE: "2"
+      ORBIT_MAX_RETRY_HOURS: "1"
+      # Uncomment to try the encryption mode: generate a key with
+      #   python3 -m relay.cli key generate
+      # and paste it into Orbit Mail under Settings, Encryption.
+      # ORBIT_RELAY_ENCRYPTION_KEY: "orbe_..."
+    ports:
+      - "2525:25"
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./queue:/var/lib/orbit-mail/queue
+      - ./maildrop:/var/spool/orbit-mail/incoming
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

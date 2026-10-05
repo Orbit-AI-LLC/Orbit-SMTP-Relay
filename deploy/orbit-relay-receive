@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Invoked by Postfix's `orbit` pipe transport with the recipient as $1.
+#
+# Postfix streams the message on stdin. It is written to the maildrop directory
+# under the recipient's address, then handed to `orbit-relay receive`, whose
+# exit status is the verdict Postfix acts on (0 accept, 75 defer, 67 reject).
+set -euo pipefail
+
+MAILDROP_DIR="${ORBIT_MAILDROP_DIR:-/var/spool/orbit-mail/incoming}"
+recipient="$(printf '%s' "${1:-}" | tr 'A-Z' 'a-z' | tr -cd 'a-z0-9@._+-')"
+if [ -z "$recipient" ]; then
+    exit 67
+fi
+
+mkdir -p "$MAILDROP_DIR"
+tmp="$(mktemp "$MAILDROP_DIR/.incoming-XXXXXX")"
+cat > "$tmp"
+# One file per recipient; a second message for the same address while the
+# first is unprocessed gets a numeric suffix the agent strips.
+target="$MAILDROP_DIR/$recipient"
+if [ -e "$target" ]; then
+    target="$target.$$"
+fi
+mv "$tmp" "$target"
+exec /opt/orbit-relay/bin/orbit-relay receive "$(basename "$target")"
