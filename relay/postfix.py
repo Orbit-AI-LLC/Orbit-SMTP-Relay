@@ -147,13 +147,14 @@ class Maildrop:
             relay_host=self.node_name,
             received_at=_now_iso(),
         )
-        # The whole message is sealed to the reader's key so the browser can
-        # parse it in full. The header block travels readable beside it: the
-        # server needs From, To, Subject and the threading headers to file
-        # the message, and they are the part a mail relay sees anyway.
-        kid, raw_public = self.keys.lookup(recipient)
+        # The whole message is sealed to the readers' keys (one for a
+        # person's mailbox, each member's for a shared one) so the browser
+        # can parse it in full. The header block travels readable beside it:
+        # the server needs From, To, Subject and the threading headers to
+        # file the message, and they are the part a mail relay sees anyway.
+        readers = self.keys.readers(recipient)
         header_block, _body = split_headers(raw_bytes)
-        envelope, ciphertext = seal(raw_bytes, [(kid, raw_public)])
+        envelope, ciphertext = seal(raw_bytes, readers)
         message.raw = ciphertext
         message.encoding = "base64"
         message.encryption = envelope

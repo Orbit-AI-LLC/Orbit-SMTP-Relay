@@ -73,8 +73,11 @@ class AnyReader:
     def __init__(self):
         self.reader = Cipher.from_text(generate_key())
 
+    def readers(self, address):
+        return [(self.reader.kid, self.reader.public_key)]
+
     def lookup(self, address):
-        return self.reader.kid, self.reader.public_key
+        return self.readers(address)[0]
 
 
 class Harness:

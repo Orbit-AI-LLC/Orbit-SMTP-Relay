@@ -174,10 +174,10 @@ class MailServerClient:
         return self.http.request(self._url(self.config.health_path), method="GET", timeout=5.0)
 
     def fetch_public_key(self, address):
-        """The reader's public key for ``address``: ``{address, kid, public_key}``.
+        """The readers' public keys for ``address``: ``{address, kid, public_key, readers}``.
 
-        Returns None when the mailbox exists but its owner has not set a key
-        yet. Raises PermanentError when this node's API key may not deliver
+        Returns None when the mailbox exists but nobody who reads it has set
+        a key yet. Raises PermanentError when this node's API key may not deliver
         to that mailbox, RetryableError when the server cannot be reached.
         """
         from urllib.parse import urlencode
@@ -190,6 +190,6 @@ class MailServerClient:
                 return None
             raise
         body = response.json()
-        if not body.get("public_key"):
+        if not body.get("public_key") and not body.get("readers"):
             return None
         return body

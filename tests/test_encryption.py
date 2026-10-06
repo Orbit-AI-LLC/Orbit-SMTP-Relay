@@ -47,16 +47,25 @@ def make_config(**overrides):
 
 
 class StaticKeys:
-    """A key directory that answers from a dict, like the server would."""
+    """A key directory that answers from a dict, like the server would.
+
+    A value is one reader's key, or a list of keys for a shared mailbox.
+    """
 
     def __init__(self, **readers):
-        self.readers = {address: Cipher.from_text(text) for address, text in readers.items()}
+        self.by_address = {
+            address: [Cipher.from_text(text) for text in (texts if isinstance(texts, list) else [texts])]
+            for address, texts in readers.items()
+        }
+
+    def readers(self, address):
+        found = self.by_address.get(address.lower())
+        if not found:
+            raise KeyUnavailable(f"{address} has not set an encryption key yet.")
+        return [(reader.kid, reader.public_key) for reader in found]
 
     def lookup(self, address):
-        reader = self.readers.get(address.lower())
-        if reader is None:
-            raise KeyUnavailable(f"{address} has not set an encryption key yet.")
-        return reader.kid, reader.public_key
+        return self.readers(address)[0]
 
 
 class KeyTests(unittest.TestCase):
@@ -255,6 +264,41 @@ class KeyDirectoryTests(unittest.TestCase):
         self.replies.append(RetryableError("down"))
         self.assertEqual(self.directory.lookup("alice@example.com"), (self.reader.kid, self.reader.public_key))
 
+    def test_every_reader_of_a_shared_mailbox_is_returned(self):
+        other = Cipher.from_text(generate_key())
+        body = {
+            "address": "support@example.com", "kid": self.reader.kid, "public_key": self.reader.public_key_text,
+            "readers": [
+                {"kid": self.reader.kid, "public_key": self.reader.public_key_text},
+                {"kid": other.kid, "public_key": other.public_key_text},
+            ],
+        }
+        self.replies.append(Response(200, json.dumps(body), {}))
+        expected = [(self.reader.kid, self.reader.public_key), (other.kid, other.public_key)]
+        self.assertEqual(self.directory.readers("support@example.com"), expected)
+        self.assertEqual(self.directory.readers("support@example.com"), expected)
+        self.assertEqual(self.directory.lookup("support@example.com"), expected[0])
+        self.assertEqual(len(self.requests), 1)
+
+    def test_a_reader_with_a_mismatched_id_spoils_the_lookup(self):
+        other = Cipher.from_text(generate_key())
+        body = {"readers": [
+            {"kid": self.reader.kid, "public_key": self.reader.public_key_text},
+            {"kid": "000000000000", "public_key": other.public_key_text},
+        ]}
+        self.replies.append(Response(200, json.dumps(body), {}))
+        with self.assertRaises(KeyUnavailable) as caught:
+            self.directory.readers("support@example.com")
+        self.assertFalse(caught.exception.retryable)
+
+    def test_a_cache_written_by_an_older_relay_still_serves(self):
+        self.directory._write("alice@example.com", {
+            "address": "alice@example.com", "kid": self.reader.kid,
+            "public_key": self.reader.public_key_text, "fetched_at": time.time(),
+        })
+        self.assertEqual(self.directory.readers("alice@example.com"), [(self.reader.kid, self.reader.public_key)])
+        self.assertEqual(self.requests, [])
+
     def test_mismatched_key_id_is_refused(self):
         self.replies.append(Response(200, json.dumps({"kid": "000000000000", "public_key": self.reader.public_key_text}), {}))
         with self.assertRaises(KeyUnavailable) as caught:
@@ -313,6 +357,14 @@ class InboundEncryptionTests(unittest.TestCase):
             on_disk = handle.read()
         self.assertNotIn(b"Noon?", on_disk)
         self.assertEqual(self.reader.open(message.encryption, message.raw), RAW.encode())
+
+    def test_shared_mailbox_mail_opens_for_every_member(self):
+        members = [generate_key(), generate_key(), generate_key()]
+        self.maildrop.keys = StaticKeys(**{"support@example.com": members})
+        message = self.accept(raw=RAW.replace("alice@example.com", "support@example.com"), name="support@example.com")
+        self.assertEqual(len(message.encryption["keys"]), 3)
+        for text in members:
+            self.assertEqual(Cipher.from_text(text).open(message.encryption, message.raw), RAW.replace("alice@example.com", "support@example.com").encode())
 
     def test_reader_without_a_key_is_not_queued(self):
         with self.assertRaises(KeyUnavailable):
