@@ -23,7 +23,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
 #   the image builds without reaching PyPI
 # ca-certificates: TLS for posting back to the web server
 # curl, jq: used by the entrypoint for health checks and Postfix TLS setup
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# --error-on=any: an unreachable mirror fails here, naming the mirror, rather
+#   than surfacing as "Unable to locate package postfix" on the next command
+RUN apt-get update --error-on=any && apt-get install -y --no-install-recommends \
         postfix \
         postfix-pcre \
         ca-certificates \

@@ -182,6 +182,57 @@ fetch_source() {
     fi
 }
 
+# --- Container network --------------------------------------------------------
+
+# The image build runs apt in a container on Docker's bridge network, not on
+# the host's. A host whose own apt works can still have its containers cut off
+# (IP forwarding off, a firewall that dropped Docker's NAT rules, a proxy only
+# the host's apt knows about), and the build then spends ten minutes timing out
+# before failing with "Unable to locate package". Fetching one small file the
+# way the build will turns that into a few seconds and says where the fault is.
+
+probe_mirror() {
+    docker run --rm -i "$@" "$BASE_IMAGE" bash -s <<'PROBE'
+. /etc/os-release
+mirror="$(sed -n 's/^URIs: *\([^ ]*\).*/\1/p' /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null | head -n1)"
+mirror="${mirror:-http://archive.ubuntu.com/ubuntu/}"
+timeout 60 /usr/lib/apt/apt-helper -o Acquire::Retries=0 -o Acquire::http::Timeout=10 \
+    download-file "${mirror%/}/dists/${VERSION_CODENAME}/InRelease" /tmp/InRelease
+PROBE
+}
+
+check_container_network() {
+    BASE_IMAGE="$(awk '$1 == "FROM" { print $2; exit }' "$INSTALL_DIR/Dockerfile")"
+    log "Checking that containers can reach the package mirror"
+    docker pull -q "$BASE_IMAGE" >/dev/null \
+        || die "Cannot pull ${BASE_IMAGE} from Docker Hub. Check this host's internet access."
+
+    local output
+    if output="$(probe_mirror 2>&1)"; then
+        return
+    fi
+    warn "A container cannot reach the Ubuntu package mirror, so the image cannot be built:"
+    grep -v '^W:' <<<"$output" | tail -n 3 | sed 's/^/    /' >&2 || true
+
+    if probe_mirror --network host >/dev/null 2>&1; then
+        die "This host reaches the mirror but its containers do not: Docker's bridge network has
+no route out. net.ipv4.ip_forward is $(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo unknown) (Docker needs 1); a firewall or
+sysctl reload after Docker started is the usual cause. Restart Docker to restore its
+rules, then re-run this installer:
+    systemctl restart docker"
+    fi
+
+    local HOST_APT_PROXY=""
+    eval "$(apt-config shell HOST_APT_PROXY Acquire::http::Proxy)"
+    if [[ -n "$HOST_APT_PROXY" ]]; then
+        die "This host's apt goes through the proxy ${HOST_APT_PROXY}; containers do not. Give Docker
+the proxy in /root/.docker/config.json, then re-run this installer:
+    {\"proxies\": {\"default\": {\"httpProxy\": \"${HOST_APT_PROXY}\", \"httpsProxy\": \"${HOST_APT_PROXY}\"}}}"
+    fi
+    die "Containers cannot reach the mirror even on the host's network. Check this host's
+outbound firewall for HTTP (port 80)."
+}
+
 ensure_encryption_key() {
     if [[ -s "$KEY_FILE" ]]; then
         log "Using the existing encryption key in $KEY_FILE"
@@ -290,8 +341,9 @@ check_os
 resolve_settings
 install_packages
 install_docker
-stop_host_postfix
 fetch_source
+check_container_network
+stop_host_postfix
 ensure_encryption_key
 write_env
 write_compose

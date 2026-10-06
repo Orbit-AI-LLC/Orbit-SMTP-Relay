@@ -60,6 +60,13 @@ the **relay hostname** on the Relay page so the DNS instructions show it).
 The host needs port 25 reachable from the internet. Many cloud providers block
 it by default and will open it on request.
 
+Its containers also need to reach the internet: the image build runs `apt`
+inside one, and the relay posts to the server from one. The installer checks
+this before building and stops with the cause if they cannot, even when the
+host's own `apt` works. Usually Docker's NAT rules were removed by a firewall
+or `sysctl` reload (`systemctl restart docker` restores them), or the host's
+`apt` uses a proxy that Docker has not been given.
+
 ## Encryption
 
 Every person has one encryption identity across Orbit: an ECDH P-256 key
