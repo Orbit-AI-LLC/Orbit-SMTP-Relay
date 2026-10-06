@@ -54,7 +54,7 @@ class QueuedMessage:
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
     recipient: str = ""
     envelope_from: str = ""
-    #: The base64 ciphertext produced by the node's encryption key
+    #: The base64 ciphertext of the message, sealed to the reader's public key
     #: (``encoding`` is ``base64``). Files from releases before 3.0 may hold
     #: the message as text; the delivery worker parks those.
     raw: str = ""
