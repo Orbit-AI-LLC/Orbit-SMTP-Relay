@@ -1,6 +1,6 @@
 """The HTTP client for the Orbit Mail server.
 
-Standard library only, so the relay image needs no third-party Python packages.
+Standard library only, so the relay needs no third-party Python packages here.
 On a node whose job is to stay up, every dependency is something that can break
 an update.
 

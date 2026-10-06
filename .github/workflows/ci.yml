@@ -28,25 +28,48 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Syntax check
-        run: bash -n install.sh deploy/entrypoint.sh deploy/orbit-relay-receive
+        run: bash -n install.sh deploy/orbit-relay-receive && sh -n deploy/orbit-relay
       - name: ShellCheck
         uses: ludeeus/action-shellcheck@2.0.0
         with:
           severity: warning
 
-  image:
-    name: Docker image
-    runs-on: ubuntu-latest
+  install:
+    name: Install on a real host
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - name: Build
-        run: docker build -t orbit-relay:ci .
-      - name: Smoke test the CLI inside the image
+      - name: Run install.sh from this checkout
         run: |
-          key="$(docker run --rm orbit-relay:ci key generate)"
-          echo "$key" | grep -q '^orbp_'
-          docker run --rm -e ORBIT_MAIL_SERVER_URL=https://mail.example.com -e ORBIT_RELAY_ENCRYPTION_KEY="$key" orbit-relay:ci check
-          # Without a key the node must refuse to run.
-          if docker run --rm -e ORBIT_MAIL_SERVER_URL=https://mail.example.com orbit-relay:ci check; then
+          # The installer clones a branch; give the checked-out commit one.
+          git checkout -B ci-install
+          sudo git config --global --add safe.directory '*'
+          sudo ./install.sh --repo "$PWD" --ref ci-install \
+              --server https://mail.example.com --key orbk_ci --hostname mx.orbit-ci.example
+      - name: Services run as intended
+        run: |
+          systemctl is-active postfix orbit-relay
+          test "$(systemctl show -p User --value orbit-relay)" = orbitmail
+          sudo runuser -u orbitmail -- orbit-relay check
+          sudo orbit-relay status
+          # Without its key the node must refuse to run.
+          if sudo ORBIT_RELAY_ENCRYPTION_KEY_FILE=/nonexistent orbit-relay check; then
             echo "check passed without an encryption key" >&2; exit 1
           fi
+      - name: Mail is accepted, sealed and queued
+        run: sudo python3 tests/host_smoke.py
+      - name: Re-running the installer keeps the node's key and settings
+        run: |
+          kid="$(sudo orbit-relay key show --id-only)"
+          echo 'ORBIT_HEARTBEAT_INTERVAL=30' | sudo tee -a /etc/orbit-mail/relay.env >/dev/null
+          sudo ./install.sh --ref ci-install
+          test "$(sudo orbit-relay key show --id-only)" = "$kid"
+          sudo grep -qx 'ORBIT_HEARTBEAT_INTERVAL=30' /etc/orbit-mail/relay.env
+          sudo grep -qx 'ORBIT_RELAY_HOSTNAME=mx.orbit-ci.example' /etc/orbit-mail/relay.env
+          systemctl is-active postfix orbit-relay
+      - name: Logs
+        if: failure()
+        run: |
+          sudo journalctl -u orbit-relay -u 'postfix@*' --no-pager -n 200 || true
+          sudo postqueue -p || true
+          sudo postconf -n || true

@@ -8,7 +8,8 @@ mail. We acknowledge reports within two working days.
 
 ## What a relay node holds
 
-- **The relay API key.** In `/etc/orbit-mail/relay.env`, mode 0600, root only.
+- **The relay API key.** In `/etc/orbit-mail/relay.env`, mode 0640, readable
+  by root and the relay's `orbitmail` user only.
   It authorises the node to fetch readers' public keys from, post inbound
   mail to, and claim outgoing mail from one Orbit Mail server, for the
   mailboxes the key covers (yours, for a key issued under Settings,
@@ -18,7 +19,8 @@ mail. We acknowledge reports within two working days.
   yet stored live on disk under `/var/lib/orbit-mail/queue`, as ciphertext
   only. The plaintext exists on the node for the moment between Postfix
   handing a message over and the agent sealing it.
-- **The node's own key.** In `/etc/orbit-mail/relay.key`, mode 0600. It
+- **The node's own key.** In `/etc/orbit-mail/relay.key`, mode 0640, for
+  root and `orbitmail` only. It
   opens outgoing mail that browsers sealed to this node, nothing else:
   inbound mail is sealed to each reader's key, which this node never holds.
   Back the node key up and treat it like a password; the node does not
@@ -51,8 +53,14 @@ is on Orbit's, and the stored mail is sealed to your key either way.
 ## Hardening the host
 
 - Keep port 25 open and nothing else inbound; the relay needs no other port.
-  The status endpoint binds to localhost.
-- Mount a real TLS certificate for the relay hostname (see the README) so
-  other mail servers can use STARTTLS with a verified chain.
+  The status endpoint listens on loopback unless `ORBIT_STATUS_ADDRESS`
+  says otherwise.
+- The agent and the receive hook run as the unprivileged `orbitmail` user;
+  only Postfix's master process runs as root.
+- Give Postfix a real TLS certificate for the relay hostname (`--tls-cert`
+  and `--tls-key`, see the README) so other mail servers can use STARTTLS
+  with a verified chain.
+- Run the relay on a host of its own. It takes over the host's Postfix, and
+  isolating it in a VM or container is yours to choose.
 - Keep the host patched. The installer is idempotent, so re-running it after
   `apt-get upgrade` is the normal update path.

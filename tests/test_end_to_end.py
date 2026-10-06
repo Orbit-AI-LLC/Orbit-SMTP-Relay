@@ -317,6 +317,19 @@ class HeartbeatTests(unittest.TestCase):
         tables = PostfixTables("")
         self.assertFalse(tables.apply({"domains": ["x.com"], "recipients": [], "config_digest": "z"}))
 
+    def test_tables_are_built_with_the_configured_type(self):
+        with tempfile.TemporaryDirectory() as workdir:
+            calls = os.path.join(workdir, "calls")
+            postmap = os.path.join(workdir, "postmap")
+            with open(postmap, "w") as handle:
+                handle.write(f'#!/bin/sh\necho "$1" >> {calls}\n')
+            os.chmod(postmap, 0o755)
+            tables = PostfixTables(os.path.join(workdir, "orbit"), postmap_path=postmap,
+                                   postfix_path=os.path.join(workdir, "absent"), db_type="lmdb")
+            self.assertTrue(tables.apply({"domains": ["x.com"], "recipients": ["a@x.com"], "config_digest": "z"}))
+            with open(calls) as handle:
+                self.assertEqual([line.split(":")[0] for line in handle.read().splitlines()], ["lmdb", "lmdb"])
+
 
 class ConfigTests(unittest.TestCase):
     def test_validation_catches_missing_settings(self):
@@ -351,6 +364,40 @@ class ConfigTests(unittest.TestCase):
         finally:
             for key in ("ORBIT_RELAY_NAME", "ORBIT_MAIL_SERVER_URL", "ORBIT_RELAY_API_KEY", "ORBIT_RELAY_ENCRYPTION_KEY"):
                 del os.environ[key]
+
+    def test_settings_file_is_read_and_the_environment_wins(self):
+        from relay.config import load_config
+
+        names = ("ORBIT_CONFIG_FILE", "ORBIT_RELAY_NAME", "ORBIT_MAIL_SERVER_URL", "ORBIT_RELAY_API_KEY", "ORBIT_STATUS_PORT")
+        saved = {name: os.environ.pop(name, None) for name in names}
+        with tempfile.TemporaryDirectory() as workdir:
+            path = os.path.join(workdir, "relay.env")
+            with open(path, "w") as handle:
+                handle.write("# a comment\n\nORBIT_RELAY_NAME=from-file\nORBIT_MAIL_SERVER_URL='https://file.example.com'\n"
+                             "ORBIT_RELAY_API_KEY=orbk_file\nnot a setting\n")
+            os.environ["ORBIT_CONFIG_FILE"] = path
+            os.environ["ORBIT_RELAY_NAME"] = "from-environment"
+            try:
+                config = load_config()
+                self.assertEqual(config.node_name, "from-environment")
+                self.assertEqual(config.server_url, "https://file.example.com")
+                self.assertEqual(config.api_key, "orbk_file")
+            finally:
+                for name in names:
+                    os.environ.pop(name, None)
+                    if saved[name] is not None:
+                        os.environ[name] = saved[name]
+
+    def test_a_missing_settings_file_is_not_an_error(self):
+        from relay.config import load_env_file
+
+        load_env_file("/nonexistent/relay.env")
+        load_env_file("")
+
+    def test_status_endpoint_listens_on_loopback_by_default(self):
+        config = Config()
+        self.assertEqual(config.status_address, "127.0.0.1")
+        self.assertEqual(config.status_port, 8080)
 
     def test_memory_logging_is_bounded(self):
         import logging

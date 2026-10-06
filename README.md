@@ -18,9 +18,10 @@ Mail stores mail it cannot open. There is no readable mode. This is the same
 relay, with the same encryption, that Orbit runs for hosted mailboxes: run
 your own, or use Orbit's.
 
-Supported hosts: **Ubuntu 22.04, 24.04 and newer; Debian 12 (bookworm), 13
-(trixie) and newer.** Only Docker runs on the host; the relay itself is one
-container.
+Supported hosts: **Ubuntu 24.04 and newer; Debian 12 (bookworm), 13
+(trixie) and newer.** The relay installs straight onto the host: the
+distribution's Postfix, the system Python and one systemd service. Whether
+that host is a VM, a container or bare metal is up to you.
 
 ## Install a node
 
@@ -40,13 +41,19 @@ curl -fsSL https://raw.githubusercontent.com/Oribt-AI/Orbit-SMTP-Relay/main/inst
     | sudo bash -s -- --server https://mail.example.com --key orbk_...
 ```
 
-The installer carries no secrets. It installs Docker, stops a host MTA that
-would hold port 25, clones this repository to `/opt/orbit-relay`, generates
-the node's own encryption key in `/etc/orbit-mail/relay.key`, writes
-`/etc/orbit-mail/relay.env` (mode 0600) with the server URL, node name and
-API key, builds the image and starts the `orbit-relay` container with port
-25 published. Re-running it updates the node in place; both keys are
-remembered.
+The installer carries no secrets. It installs Postfix, Python and
+`python3-cryptography` with `apt`, clones this repository to
+`/opt/orbit-relay`, creates the `orbitmail` system user, generates the node's
+own encryption key in `/etc/orbit-mail/relay.key`, and writes
+`/etc/orbit-mail/relay.env` with the server URL, node name and API key (both
+files readable by root and `orbitmail` only). It then configures the host's
+Postfix to hand accepted mail to the agent, and starts the agent as the
+`orbit-relay` service. Re-running it updates the node in place; its settings
+and both keys are remembered.
+
+The host's Postfix becomes the relay. A `main.cf` the installer did not write
+is kept as `/etc/postfix/main.cf.before-orbit-relay`, and installing Postfix
+replaces Exim on Debian, so use a host that runs no other mail server.
 
 Then point each domain's MX record at this host (an administrator also sets
 the **relay hostname** on the Relay page so the DNS instructions show it).
@@ -55,10 +62,21 @@ the **relay hostname** on the Relay page so the DNS instructions show it).
 |---|---|
 | `--name relay-2` | Name a second node. |
 | `--hostname mx1.example.com` | The EHLO name; should match the MX record and the host's PTR record. |
-| `--ref v3.0.0` | Pin a release instead of `main`. |
+| `--tls-cert <path>` / `--tls-key <path>` | The certificate Postfix presents for STARTTLS, such as Let's Encrypt's `fullchain.pem` and `privkey.pem`. |
+| `--status-port 8081` | Move the local status endpoint; `0` turns it off. |
+| `--ref v3.1.0` | Pin a release instead of `main`. |
 
 The host needs port 25 reachable from the internet. Many cloud providers block
-it by default and will open it on request.
+it by default and will open it on request. The installer opens it in `ufw`
+when `ufw` is active.
+
+**Moving from 3.0 or earlier.** Those releases ran the node in Docker.
+Re-running the install command on such a host stops and removes the
+`orbit-relay` container, copies its queue and state out of the Docker volumes
+into `/var/lib/orbit-mail`, and carries on as above. Docker itself, the old
+image and the volumes are left for you to remove; the installer prints the
+commands. A TLS certificate the container read from a mounted path needs
+`--tls-cert` and `--tls-key` with the host's paths.
 
 ## Encryption
 
@@ -115,10 +133,10 @@ Things to know:
 Useful commands on the node:
 
 ```bash
-docker exec orbit-relay orbit-relay key show            # this node's key id and public key
-docker exec orbit-relay orbit-relay key show --id-only  # just the key id
-docker exec orbit-relay orbit-relay key show --private  # the private key, for copying to another node
-docker exec orbit-relay orbit-relay key generate        # print a fresh key without installing it
+sudo orbit-relay key show            # this node's key id and public key
+sudo orbit-relay key show --id-only  # just the key id
+sudo orbit-relay key show --private  # the private key, for copying to another node
+orbit-relay key generate             # print a fresh key without installing it
 ```
 
 ## What the agent does
@@ -133,7 +151,7 @@ docker exec orbit-relay orbit-relay key generate        # print a fresh key with
         control loop <-- POST /api/relay/heartbeat/ (domains, addresses, settings)
                |
                v
-        Postfix tables (relay_domains, relay_recipients) + reload
+        Postfix tables (relay_domains, relay_recipients), rebuilt with postmap
 
         outbound worker <-- POST /api/relay/outbound/claim/
                |
@@ -153,9 +171,9 @@ backoff. A message the server rejects for good (no such mailbox) is parked in
 version, its key id and public key, last error) and receives the domains,
 deliverable addresses, catch-all domains and fleet settings the node's API
 key may serve: everything for the admin key, the owner's mailboxes for a
-user key. The agent writes
-them as Postfix lookup tables and reloads Postfix only when the server's
-`config_digest` changes.
+user key. The agent writes them as Postfix lookup tables only when the
+server's `config_digest` changes; Postfix notices a rebuilt table by itself,
+so the agent needs no root to update it.
 
 **Outbound.** The agent claims batches of queued messages, hands each to
 Postfix through `sendmail -f <sender> <recipients>`, and reports `sent`,
@@ -169,27 +187,34 @@ Postfix through `sendmail -f <sender> <recipients>`, and reports `sent`,
 /var/lib/orbit-mail/queue/dead/        gave up; kept for inspection
 ```
 
-Logs default to a bounded in-memory ring (`ORBIT_LOG_BACKEND=memory`); the
-container's stdout still carries everything for `docker logs`.
+Logs go to the journal. The agent also keeps a bounded in-memory ring of
+recent events (`ORBIT_LOG_BACKEND=memory`), served at `/logs` on the status
+endpoint.
 
 ## Operating a node
 
 ```bash
 curl -s http://127.0.0.1:8080/status | python3 -m json.tool   # queue, server reachability, encryption, counters
-docker exec orbit-relay orbit-relay ping     # contact the server once
-docker exec orbit-relay orbit-relay status   # queue depth
-docker exec orbit-relay orbit-relay logs     # recent events
-docker exec orbit-relay orbit-relay dead     # parked messages
-docker logs -f orbit-relay                   # everything, including Postfix
+curl -s http://127.0.0.1:8080/logs | python3 -m json.tool     # the agent's recent events
+sudo orbit-relay ping                  # contact the server once
+sudo orbit-relay status                # queue depth
+sudo orbit-relay dead                  # parked messages
+systemctl status orbit-relay postfix   # both services
+journalctl -u orbit-relay -f           # the agent's log
+journalctl -u 'postfix@*' -f           # Postfix's log (also /var/log/mail.log on Ubuntu)
 ```
+
+`orbit-relay` reads `/etc/orbit-mail/relay.env` itself, so it needs root or
+the `orbitmail` user; a variable set in the environment overrides the file
+for that one command.
 
 A growing `pending` count means the server is unreachable or refusing
 messages. A growing `dead` count means something is permanently wrong; look at
 `last_error` there before assuming a transient outage.
 
-**Updating.** Re-run the install command. It pulls the latest source, rebuilds
-the image and restarts the container; the queue lives in a Docker volume and
-survives.
+**Updating.** Re-run the install command. It pulls the latest source,
+rewrites the Postfix configuration and restarts both services; the queue in
+`/var/lib/orbit-mail` is untouched.
 
 **Rotating the API key.** Rotate it in the admin area, then re-run the install
 command with the new key on each node. Until then, the node keeps accepting and
@@ -202,18 +227,26 @@ next one. Point each domain's MX at the node(s) you want, with equal preference
 for round-robin.
 
 **TLS.** Postfix offers STARTTLS with a self-signed certificate out of the box.
-To present a real one, set `ORBIT_TLS_CERT` and `ORBIT_TLS_KEY` in
-`/etc/orbit-mail/relay.env` to paths inside the container and add the files
-to the `volumes` list in `/opt/orbit-relay/docker-compose.yml`.
+To present a real one, re-run the install command with `--tls-cert` and
+`--tls-key`; they are remembered. Postfix reads the files as root, so a
+Let's Encrypt certificate can stay where certbot puts it. After a renewal,
+`systemctl reload postfix` picks it up.
 
-**DKIM.** Mount a signing key into `/etc/orbit-mail/dkim` and configure a DKIM
+**Postfix.** The installer owns `/etc/postfix/main.cf` and rewrites it on
+every run, so a hand edit there lasts until the next update. The hostname and
+the TLS certificate are installer options for that reason.
+
+**DKIM.** Put a signing key in `/etc/orbit-mail/dkim` and configure a DKIM
 milter in Postfix if you need signed outbound mail; paste the public key into
 the domain's page in the admin area so it appears in the DNS records.
 
 ## Configuration
 
 Everything is an environment variable, written by the installer to
-`/etc/orbit-mail/relay.env`.
+`/etc/orbit-mail/relay.env`. The agent, Postfix's receive hook and every
+`orbit-relay` command read that file themselves; a variable already set in
+the environment wins. Settings you add to the file by hand survive a re-run
+of the installer.
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -228,35 +261,35 @@ Everything is an environment variable, written by the installer to
 | `ORBIT_HEARTBEAT_INTERVAL` | `60` | Seconds; the server may override. |
 | `ORBIT_OUTBOUND_POLL_INTERVAL` | `5` | Seconds between empty outbound polls. |
 | `ORBIT_QUEUE_DIR` | `/var/lib/orbit-mail/queue` | Durable queue. |
-| `ORBIT_POSTFIX_DIR` | `/etc/postfix/orbit` | Where the lookup tables are written; blank disables. |
+| `ORBIT_POSTFIX_DIR` | `/etc/postfix/orbit` | Where the lookup tables are written. |
+| `ORBIT_POSTFIX_DB_TYPE` | `hash` | Their table type; the installer sets the host Postfix's default. |
+| `ORBIT_STATUS_PORT` | `8080` | The status endpoint's port; `0` turns it off. |
+| `ORBIT_STATUS_ADDRESS` | `127.0.0.1` | Where it listens. It is unauthenticated; keep it on loopback. |
+| `ORBIT_CONFIG_FILE` | `/etc/orbit-mail/relay.env` | The settings file itself; blank reads none. |
 | `ORBIT_MAX_RETRY_HOURS` | `72` | Before an inbound message is parked. |
 | `ORBIT_BACKOFF_BASE` / `_MAX` | `5` / `300` | Retry backoff, seconds. |
 | `ORBIT_LOG_BACKEND` | `memory` | `memory` or `file`. |
 | `ORBIT_VERIFY_TLS` | `1` | Set `0` only against a local self-signed server. |
-| `ORBIT_TLS_CERT` / `ORBIT_TLS_KEY` | snakeoil | Certificate and key Postfix presents for STARTTLS. |
+| `ORBIT_TLS_CERT` / `ORBIT_TLS_KEY` | snakeoil | Certificate and key Postfix presents for STARTTLS. Set with `--tls-cert` and `--tls-key`; the installer writes them into `main.cf`. |
 
-## Running it by hand
+## Running it without the installer
 
-Without the installer, on any host with Docker. The node needs a key of its
-own before it starts:
+The installer is the reference: each step is a short, commented function in
+`install.sh`. Beside a Postfix you manage yourself, the relay needs:
 
-```bash
-git clone https://github.com/Oribt-AI/Orbit-SMTP-Relay.git /opt/orbit-relay
-cd /opt/orbit-relay
-docker build -t orbit-relay .
-sudo install -d -m 0750 /etc/orbit-mail
-docker run --rm orbit-relay key generate | sudo tee /etc/orbit-mail/relay.key >/dev/null
-sudo chmod 0600 /etc/orbit-mail/relay.key
-docker run -d --name orbit-relay --restart unless-stopped \
-    -p 25:25 -p 127.0.0.1:8080:8080 \
-    -e ORBIT_MAIL_SERVER_URL=https://mail.example.com \
-    -e ORBIT_RELAY_API_KEY=orbk_... \
-    -e ORBIT_RELAY_HOSTNAME=mx1.example.com \
-    -v /etc/orbit-mail/relay.key:/etc/orbit-mail/relay.key:ro \
-    -v orbit-relay-queue:/var/lib/orbit-mail \
-    -v orbit-relay-spool:/var/spool/orbit-mail \
-    orbit-relay
-```
+- this repository in `/opt/orbit-relay`, with `deploy/orbit-relay` and
+  `deploy/orbit-relay-receive` installed in `/usr/local/bin`, and Python 3.11
+  or newer with `cryptography`;
+- an `orbitmail` system user owning `/var/lib/orbit-mail`,
+  `/var/spool/orbit-mail` and `/etc/postfix/orbit`;
+- `/etc/orbit-mail/relay.env` and a key written with
+  `orbit-relay key generate --write /etc/orbit-mail/relay.key`, both readable
+  by `orbitmail`;
+- the `orbit` pipe transport in `master.cf`, and in `main.cf`
+  `relay_transport = orbit:`, `orbit_destination_recipient_limit = 1` and the
+  two tables as `relay_domains` and `relay_recipient_maps`
+  (`configure_postfix` in `install.sh` writes the full set);
+- `deploy/orbit-relay.service` in `/etc/systemd/system`, enabled.
 
 ## Development
 
@@ -273,16 +306,22 @@ to queue to server path, the key directory's caching and deferrals, the
 heartbeat's table writing, the outbound claim to sendmail to report path,
 and the encryption format against the primitives the browser uses.
 
-To run a node against a local Orbit Mail server:
+To run the agent against a local Orbit Mail server on port 8100, with
+everything it writes kept under `dev/`:
 
 ```bash
-docker compose -f deploy/docker-compose.dev.yml up --build
+mkdir -p dev && python3 -m relay.cli key generate --write dev/relay.key
+export ORBIT_CONFIG_FILE= ORBIT_MAIL_SERVER_URL=http://localhost:8100 ORBIT_RELAY_API_KEY=orbk_...
+export ORBIT_RELAY_ENCRYPTION_KEY_FILE=dev/relay.key ORBIT_QUEUE_DIR=dev/queue \
+    ORBIT_MAILDROP_DIR=dev/incoming ORBIT_STATE_DIR=dev/state ORBIT_POSTFIX_DIR=dev/postfix
+python3 -m relay.cli run
 ```
 
-with Orbit Mail on the host at port 8100, a relay API key in
-`ORBIT_RELAY_API_KEY` and a node key (`python3 -m relay.cli key generate`)
-in `ORBIT_RELAY_ENCRYPTION_KEY`. SMTP is on port 2525, status on
-127.0.0.1:8080.
+It heartbeats, writes the tables it is sent into `dev/postfix` and claims
+outgoing mail; without Postfix there is no SMTP, so inbound mail is what the
+tests and CI's install job cover. CI installs a node on a fresh Ubuntu host
+with `install.sh` and runs `tests/host_smoke.py` against it: a message sent
+over SMTP must come out of the queue sealed to the reader's key.
 
 ## Licence
 

@@ -1,0 +1,28 @@
+# The relay agent, installed by install.sh. Postfix runs beside it as the
+# distribution's own postfix service.
+#
+# The agent reads its settings from /etc/orbit-mail/relay.env itself, as the
+# receive hook and operator commands do, so nothing is passed in here.
+
+[Unit]
+Description=Orbit SMTP Relay agent
+Documentation=https://github.com/Oribt-AI/Orbit-SMTP-Relay
+Wants=network-online.target postfix.service
+After=network-online.target postfix.service
+# Never give up: the queue is durable, and a stopped agent means mail
+# accumulating undelivered.
+StartLimitIntervalSec=0
+
+[Service]
+User=orbitmail
+Group=orbitmail
+ExecStart=/usr/local/bin/orbit-relay run
+Restart=always
+RestartSec=5
+# Each worker finishes the message in hand before the agent exits.
+TimeoutStopSec=60
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -57,9 +57,9 @@ _memory_handler = MemoryHandler()
 def setup_logging(level="INFO", backend="memory", max_entries=500, path=""):
     """Configure the root logger from configuration values.
 
-    Always adds a stderr handler: a container's logs have to go somewhere even
-    when on-disk logging is off, and `docker logs` is the transport rather than
-    a stored archive.
+    Always adds a stderr handler: the service's logs have to go somewhere even
+    when on-disk logging is off, and the journal (`journalctl -u orbit-relay`)
+    is the transport rather than a stored archive.
     """
     root = logging.getLogger()
     root.handlers.clear()

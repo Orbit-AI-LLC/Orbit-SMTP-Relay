@@ -22,4 +22,4 @@ if [ -e "$target" ]; then
     target="$target.$$"
 fi
 mv "$tmp" "$target"
-exec /opt/orbit-relay/bin/orbit-relay receive "$(basename "$target")"
+exec /usr/local/bin/orbit-relay receive "$(basename "$target")"
