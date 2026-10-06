@@ -11,11 +11,11 @@
 # place: the API key and the encryption key are remembered.
 #
 # What it does: installs Docker if it is missing, stops a host Postfix that
-# would hold port 25, clones this repository to /opt/orbit-relay, writes a
-# root-only environment file with the server URL and API key, builds the image
-# and starts the orbit-relay container with port 25 published. With --encrypt
-# it also generates an encryption key so mail is sealed on this host before it
-# reaches the server.
+# would hold port 25, clones this repository to /opt/orbit-relay, generates
+# the node's encryption key once, writes a root-only environment file with the
+# server URL and API key, builds the image and starts the orbit-relay
+# container with port 25 published. Mail is sealed on this host with that key
+# before it reaches the server; the relay has no readable mode.
 #
 # The script carries no secrets. The keys are written straight to
 # /etc/orbit-mail (mode 0600) and nowhere else.
@@ -37,7 +37,6 @@ ENV_FILE="$ENV_DIR/relay.env"
 KEY_FILE="$ENV_DIR/relay.key"
 CONTAINER=orbit-relay
 STATUS_PORT=8080
-ENCRYPT=auto
 
 usage() {
     cat <<'USAGE'
@@ -47,12 +46,14 @@ Install or update an Orbit SMTP Relay node.
   --key <api-key>      Relay API key from the Orbit Mail admin area (required on first install)
   --name <name>        Node name shown in the admin area (default: short hostname)
   --hostname <fqdn>    Hostname Postfix announces in EHLO (default: this host's FQDN)
-  --encrypt            Encrypt mail on this host before it reaches the server (generates a key once)
-  --no-encrypt         Run without encryption even if a key file exists
   --repo <git-url>     Relay source repository
   --ref <branch|tag>   Git ref to build (default: main)
   --status-port <n>    Local port for the relay's status endpoint (default: 8080)
   -h, --help           Show this help
+
+Mail is always sealed on this host before it reaches the server. The key is
+generated once in /etc/orbit-mail/relay.key and remembered on re-runs; copy
+that file to another host first to have several nodes share one key.
 USAGE
 }
 
@@ -62,8 +63,8 @@ while [[ $# -gt 0 ]]; do
         --key) API_KEY="$2"; shift 2 ;;
         --name) NODE_NAME="$2"; shift 2 ;;
         --hostname) RELAY_HOSTNAME="$2"; shift 2 ;;
-        --encrypt) ENCRYPT=yes; shift ;;
-        --no-encrypt) ENCRYPT=no; shift ;;
+        --encrypt) shift ;;  # accepted for commands printed by older servers; it is the only mode
+        --no-encrypt) echo "The relay always seals mail; --no-encrypt is not supported." >&2; exit 2 ;;
         --repo) REPO_URL="$2"; shift 2 ;;
         --ref) REPO_REF="$2"; shift 2 ;;
         --status-port) STATUS_PORT="$2"; shift 2 ;;
@@ -128,10 +129,6 @@ resolve_settings() {
     if [[ "$SERVER_URL" =~ ^http:// ]]; then
         warn "The server URL is plain http. The API key will travel unencrypted; use https in production."
     fi
-
-    if [[ "$ENCRYPT" == "auto" ]]; then
-        if [[ -f "$KEY_FILE" ]]; then ENCRYPT=yes; else ENCRYPT=no; fi
-    fi
 }
 
 # --- Packages -----------------------------------------------------------------
@@ -186,15 +183,14 @@ fetch_source() {
 }
 
 ensure_encryption_key() {
-    [[ "$ENCRYPT" == "yes" ]] || return 0
-    if [[ -f "$KEY_FILE" ]]; then
+    if [[ -s "$KEY_FILE" ]]; then
         log "Using the existing encryption key in $KEY_FILE"
         return
     fi
     log "Generating an encryption key in $KEY_FILE"
     install -d -m 0750 "$ENV_DIR"
     umask 077
-    printf 'orbe_%s\n' "$(head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=\n')" > "$KEY_FILE"
+    printf 'orbp_%s\n' "$(head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=\n')" > "$KEY_FILE"
     chmod 0600 "$KEY_FILE"
 }
 
@@ -218,23 +214,16 @@ ORBIT_BACKOFF_MAX=300
 
 # Logs stay in a bounded in-memory ring; docker logs still shows everything.
 ORBIT_LOG_BACKEND=memory
-EOF
-    if [[ "$ENCRYPT" == "yes" ]]; then
-        cat >> "$ENV_FILE" <<EOF
 
-# Mail is encrypted on this host with the key below before it reaches the
-# server. Paste the key into Orbit Mail under Settings, Encryption, to read it.
+# This node's own key. Mail people write in Orbit Mail is sealed to it in
+# their browser and opened here to be sent; inbound mail is sealed to each
+# reader's key, fetched from the server.
 ORBIT_RELAY_ENCRYPTION_KEY_FILE=/etc/orbit-mail/relay.key
 EOF
-    fi
     chmod 0600 "$ENV_FILE"
 }
 
 write_compose() {
-    local key_mount=""
-    if [[ "$ENCRYPT" == "yes" ]]; then
-        key_mount="      - ${KEY_FILE}:/etc/orbit-mail/relay.key:ro"
-    fi
     cat > "$INSTALL_DIR/docker-compose.yml" <<EOF
 services:
   relay:
@@ -254,7 +243,8 @@ services:
       - orbit-relay-queue:/var/lib/orbit-mail
       - orbit-relay-spool:/var/spool/orbit-mail
       - orbit-relay-dkim:/etc/orbit-mail/dkim
-${key_mount}
+      # The encryption key, read-only. The relay does not start without it.
+      - ${KEY_FILE}:/etc/orbit-mail/relay.key:ro
     cap_add:
       - NET_BIND_SERVICE
       - SETGID
@@ -319,22 +309,9 @@ $(log "Relay node ${NODE_NAME} is installed.")
   Container log : docker logs -f ${CONTAINER}
   Configuration : ${ENV_FILE}
   Update        : re-run this install command (the keys are remembered)
-SUMMARY
-
-if [[ "$ENCRYPT" == "yes" ]]; then
-    cat <<SUMMARY
-  Encryption    : on. Mail is sealed on this host before it reaches the server.
-                  Show the key to paste into Orbit Mail (Settings, Encryption):
-                    sudo cat ${KEY_FILE}
-                  Back it up. Without it the mail this node encrypts cannot be read.
-SUMMARY
-else
-    cat <<SUMMARY
-  Encryption    : off. Re-run with --encrypt to seal mail on this host.
-SUMMARY
-fi
-
-cat <<SUMMARY
+  Encryption    : inbound mail is sealed to each reader's key before it reaches
+                  the server. This node's own key is ${KEY_FILE}; back it up,
+                  and show its id with: docker exec ${CONTAINER} orbit-relay key show
 
 Next: in the Orbit Mail admin area, set the relay hostname to ${RELAY_HOSTNAME}
 and point each domain's MX record at it.

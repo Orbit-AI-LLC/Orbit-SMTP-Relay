@@ -13,10 +13,12 @@ What counts as which result:
 * ``failed``: sendmail rejected the message outright, for instance a malformed
   recipient. The server marks it failed and the sender sees it in the client.
 
-When the relay encrypts, outgoing mail arrives from the server as a sealed
-JSON document the browser produced (body and attachments) plus the readable
-headers. The message is assembled here, on the node, so the server never
-holds the plaintext of what was written.
+Outgoing mail written with a key in the browser arrives from the server as a
+sealed JSON document (body and attachments) plus the readable headers. The
+message is assembled here, on the node, so the server never holds the
+plaintext of what was written. A message composed in a browser that held no
+key is already readable on the server; it is sent as it is, since refusing it
+would protect nothing.
 """
 
 from __future__ import annotations
@@ -118,10 +120,10 @@ def build_message(headers, body, attachments=()):
 def decode_item(item, cipher=None):
     """The bytes to hand to sendmail for one claimed message.
 
-    A plain item is used as it is. An encrypted one is opened with this
-    node's key and assembled; EncryptionError is raised when the key is
-    missing or does not match, which the caller reports as deferred so a node
-    that does hold the key can pick the message up.
+    A plain item is used as it is. A sealed one is opened with this node's
+    private key and assembled; EncryptionError is raised when the message was
+    not sealed to this node, which the caller reports as deferred so the node
+    it was sealed to can pick the message up.
     """
     envelope = item.get("encrypted")
     if not envelope:

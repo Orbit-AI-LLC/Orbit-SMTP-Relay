@@ -1,13 +1,11 @@
 [project]
 name = "orbit-relay"
-version = "2.1.0"
+version = "3.0.0"
 description = "Relay agent that runs SMTP for Orbit Mail: inbound mail to the server, outbound mail from it."
 requires-python = ">=3.11"
-dependencies = []
-
-[project.optional-dependencies]
-# Only needed when the node encrypts mail (ORBIT_RELAY_ENCRYPTION_KEY_FILE).
-encryption = ["cryptography>=41"]
+# AES-256-GCM for sealing mail on the node. In the image it comes from the
+# distribution (python3-cryptography); elsewhere pip installs it.
+dependencies = ["cryptography>=41"]
 
 [project.scripts]
 orbit-relay = "relay.cli:main"

@@ -54,17 +54,17 @@ class QueuedMessage:
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
     recipient: str = ""
     envelope_from: str = ""
-    #: The message as text, or, when ``encoding`` is ``base64``, the
-    #: base64 ciphertext produced by the relay's encryption key.
+    #: The base64 ciphertext produced by the node's encryption key
+    #: (``encoding`` is ``base64``). Files from releases before 3.0 may hold
+    #: the message as text; the delivery worker parks those.
     raw: str = ""
     encoding: str = ""
     received_at: str = ""
     relay_host: str = ""
 
-    #: Set when the message was encrypted on this node: the non-secret
-    #: parameters (key id, nonce, algorithm) the reader needs, the header
-    #: block kept readable for routing and threading, and two hints the
-    #: server can no longer compute for itself.
+    #: The non-secret encryption parameters (key id, nonce, algorithm) the
+    #: reader needs, the header block kept readable for routing and
+    #: threading, and two hints the server can no longer compute for itself.
     encryption: dict = field(default_factory=dict)
     headers: str = ""
     has_attachments: bool = False

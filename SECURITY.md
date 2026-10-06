@@ -9,32 +9,44 @@ mail. We acknowledge reports within two working days.
 ## What a relay node holds
 
 - **The relay API key.** In `/etc/orbit-mail/relay.env`, mode 0600, root only.
-  It authorises the node to post inbound mail to one Orbit Mail server and to
-  claim outgoing mail from it. Rotate it from the Orbit Mail admin area; the
-  old key stops working at once.
+  It authorises the node to fetch readers' public keys from, post inbound
+  mail to, and claim outgoing mail from one Orbit Mail server, for the
+  mailboxes the key covers (yours, for a key issued under Settings,
+  Encryption; every mailbox, for the admin key). Rotate it where it was
+  issued; the old key stops working at once.
 - **Mail in transit.** Messages Postfix has accepted but the server has not
-  yet stored live on disk under `/var/lib/orbit-mail/queue`. With encryption
-  on, the queue holds ciphertext only.
-- **The encryption key** (optional). In `/etc/orbit-mail/relay.key`, mode
-  0600. Anyone who holds it can read every message this node sealed, so back
-  it up somewhere safe and treat it like a password.
+  yet stored live on disk under `/var/lib/orbit-mail/queue`, as ciphertext
+  only. The plaintext exists on the node for the moment between Postfix
+  handing a message over and the agent sealing it.
+- **The node's own key.** In `/etc/orbit-mail/relay.key`, mode 0600. It
+  opens outgoing mail that browsers sealed to this node, nothing else:
+  inbound mail is sealed to each reader's key, which this node never holds.
+  Back the node key up and treat it like a password; the node does not
+  start without one.
+- **Readers' public keys**, cached under the state directory. Public, by
+  definition.
 
 The node never holds an account password, a session or a database connection
 to the server. It makes outbound HTTPS requests only.
 
 ## What the server can and cannot see
 
-Without encryption, the Orbit Mail server stores mail readable, exactly like
-any hosted mail service.
-
-With encryption on, the server stores the message body and attachments as
-AES-256-GCM ciphertext made on your relay with a key the server never
-receives. The header block (sender, recipients, subject, date and the
+The Orbit Mail server stores the message body and attachments as
+AES-256-GCM ciphertext, sealed on the relay to the reader's ECDH P-256 public
+key. The matching private key is derived in the reader's browser from their
+Orbit password and never exists on any server. There is no unencrypted
+mode. The header block (sender, recipients, subject, date and the
 threading headers) is stored readable so the server can file, list and thread
 messages. SMTP metadata is visible to every relay on the internet anyway; the
 subject is the one piece of content this design deliberately leaves readable.
-Outgoing mail written in Orbit Mail is encrypted in the browser and decrypted
-only on your relay to hand it to Postfix.
+Outgoing mail written in Orbit Mail is encrypted in the browser, to the
+author and to the relay nodes online, and decrypted only on a relay to hand
+it to Postfix.
+
+The relay host sees a message for the instant between Postfix accepting it
+and the agent sealing it, as every mail server on a message's path does. On
+a relay you run, that instant is on your machine; on a relay Orbit runs, it
+is on Orbit's, and the stored mail is sealed to your key either way.
 
 ## Hardening the host
 

@@ -19,8 +19,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 # postfix: the SMTP server that actually receives mail
 # python3-minimal: the agent itself
-# python3-cryptography: AES-GCM for the optional encryption mode, from the
-#   distribution so the image builds without reaching PyPI
+# python3-cryptography: AES-GCM for sealing mail, from the distribution so
+#   the image builds without reaching PyPI
 # ca-certificates: TLS for posting back to the web server
 # curl, jq: used by the entrypoint for health checks and Postfix TLS setup
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -52,9 +52,9 @@ RUN chmod +x /usr/local/bin/orbit-relay-entrypoint /usr/local/bin/orbit-relay-re
     && chown -R orbitmail:orbitmail /var/lib/orbit-mail /var/spool/orbit-mail /etc/postfix/orbit
 
 # --system-site-packages lets the venv see the distribution's cryptography
-# package; the agent itself still has no PyPI dependencies.
+# package, the agent's one dependency, so pip never reaches PyPI for it.
 RUN python3 -m venv --system-site-packages /opt/orbit-relay \
-    && /opt/orbit-relay/bin/pip install --no-cache-dir /app
+    && /opt/orbit-relay/bin/pip install --no-cache-dir --no-deps /app
 
 ENV PATH="/opt/orbit-relay/bin:$PATH"
 

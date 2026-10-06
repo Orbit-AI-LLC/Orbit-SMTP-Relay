@@ -1,6 +1,9 @@
-# The relay agent deliberately has no third-party dependencies.
+# The relay agent has one third-party dependency: cryptography, for the
+# AES-256-GCM sealing of every message. Inside the image it comes from the
+# distribution's python3-cryptography package, so a node's image can be
+# rebuilt years from now without reaching PyPI and still start.
 #
-# Postfix handles TLS, SPF, DKIM and rate limiting; the agent needs only the
-# standard library to move a file from a directory to an HTTP endpoint and
-# retry it until it lands. Keeping the dependency set empty means a node's
-# image can be rebuilt years from now and still start.
+# Postfix handles TLS, SPF, DKIM and rate limiting; beyond that the agent
+# needs only the standard library to move a file from a directory to an HTTP
+# endpoint and retry it until it lands.
+cryptography>=41

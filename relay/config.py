@@ -4,11 +4,13 @@ Everything is an environment variable so the same image runs unchanged on every
 node; a node differs only by its name and the API key. The install script
 served by Orbit Mail writes these into ``/etc/orbit-mail/relay.env``.
 
-There are exactly two things a node must know: where the Orbit Mail server is
-and the relay API key issued in its admin area. Everything else, including the
-domains and addresses it should accept mail for, is downloaded from the server
-on every heartbeat. A third, optional setting turns on encryption: see
-``relay/crypto.py``.
+There are exactly three things a node must know: where the Orbit Mail server
+is, the relay API key issued there, and its own encryption key, which opens
+the outgoing mail people seal to it (see ``relay/crypto.py``). Everything
+else, including the domains and addresses it should accept mail for and the
+public keys it seals inbound mail to, is downloaded from the server. A node
+without a key of its own refuses to start: the relay never hands the server
+readable mail.
 """
 
 from __future__ import annotations
@@ -42,6 +44,10 @@ def _env_bool(name, default=False):
     return raw in {"1", "true", "yes", "on"}
 
 
+#: Where the installer writes the node's encryption key.
+DEFAULT_KEY_FILE = "/etc/orbit-mail/relay.key"
+
+
 @dataclass
 class Config:
     """The relay agent's runtime settings."""
@@ -61,16 +67,22 @@ class Config:
     outbound_claim_path: str = field(default_factory=lambda: _env("ORBIT_OUTBOUND_CLAIM_PATH", "/api/relay/outbound/claim/"))
     outbound_result_path: str = field(default_factory=lambda: _env("ORBIT_OUTBOUND_RESULT_PATH", "/api/relay/outbound/{id}/result/"))
     health_path: str = field(default_factory=lambda: _env("ORBIT_HEALTH_PATH", "/api/relay/health/"))
+    keys_path: str = field(default_factory=lambda: _env("ORBIT_KEYS_PATH", "/api/relay/keys/"))
     #: Set to 0 only for a local http server with a self-signed certificate.
     verify_tls: bool = field(default_factory=lambda: _env_bool("ORBIT_VERIFY_TLS", True))
 
     # --- Encryption -------------------------------------------------------
-    #: Optional. When set, mail is encrypted on this node before it reaches
-    #: the server and decrypted in the reader's browser. Either the key
-    #: itself (``orbe_...``) or a file holding it; the file is preferred so
-    #: the key never appears in a process listing or a compose file.
+    #: Required. This node's private key (``orbp_...``), which opens the
+    #: outgoing mail browsers seal to its public key. Either the key itself
+    #: or a file holding it; the file is preferred so the key never appears
+    #: in a process listing or a compose file. The file defaults to where the
+    #: installer writes it.
     encryption_key: str = field(default_factory=lambda: _env("ORBIT_RELAY_ENCRYPTION_KEY", ""))
-    encryption_key_file: str = field(default_factory=lambda: _env("ORBIT_RELAY_ENCRYPTION_KEY_FILE", ""))
+    encryption_key_file: str = field(default_factory=lambda: _env("ORBIT_RELAY_ENCRYPTION_KEY_FILE", DEFAULT_KEY_FILE))
+    #: How long a reader's public key, fetched from the server, is trusted
+    #: before it is fetched again; and how long "no key yet" is remembered.
+    key_cache_seconds: int = field(default_factory=lambda: _env_int("ORBIT_KEY_CACHE_SECONDS", 600))
+    missing_key_cache_seconds: int = field(default_factory=lambda: _env_int("ORBIT_MISSING_KEY_CACHE_SECONDS", 60))
 
     #: How often to check in; the server may ask for a different interval.
     heartbeat_interval: int = field(default_factory=lambda: _env_int("ORBIT_HEARTBEAT_INTERVAL", 60))
@@ -118,18 +130,13 @@ class Config:
             problems.append("ORBIT_BACKOFF_BASE must be greater than zero.")
         if self.backoff_max < self.backoff_base:
             problems.append("ORBIT_BACKOFF_MAX must be at least ORBIT_BACKOFF_BASE.")
-        if self.encryption_key or self.encryption_key_file:
-            from .crypto import EncryptionError, load_cipher
+        from .crypto import EncryptionError, load_cipher
 
-            try:
-                load_cipher(self)
-            except EncryptionError as error:
-                problems.append(f"Encryption: {error}")
+        try:
+            load_cipher(self)
+        except EncryptionError as error:
+            problems.append(f"Encryption: {error}")
         return problems
-
-    @property
-    def encryption_enabled(self):
-        return bool(self.encryption_key or self.encryption_key_file)
 
     @property
     def has_api_key(self):

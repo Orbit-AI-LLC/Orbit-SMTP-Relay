@@ -9,6 +9,12 @@
 
 set -euo pipefail
 
+# Operator commands (status, check, ping, logs, dead, key ...) need none of
+# the Postfix setup below, and `key generate` must work before a key exists.
+if [ "${1:-run}" != "run" ]; then
+    exec /opt/orbit-relay/bin/orbit-relay "$@"
+fi
+
 MAILDROP_DIR="${ORBIT_MAILDROP_DIR:-/var/spool/orbit-mail/incoming}"
 QUEUE_DIR="${ORBIT_QUEUE_DIR:-/var/lib/orbit-mail/queue}"
 STATE_DIR="${ORBIT_STATE_DIR:-/var/lib/orbit-mail/state}"
@@ -114,17 +120,23 @@ log "Node ${ORBIT_RELAY_NAME:-$(hostname -s)} -> ${ORBIT_MAIL_SERVER_URL:-unset}
 if [ -z "${ORBIT_RELAY_API_KEY:-}" ]; then
     log "WARNING: ORBIT_RELAY_API_KEY is unset. Mail will queue locally until a key is configured."
 fi
-# The receive hook is started by Postfix as the orbitmail user, so the key
+# Every node seals mail before it reaches the server; there is no readable
+# mode. The key comes from ORBIT_RELAY_ENCRYPTION_KEY (the key itself) or,
+# normally, the file the installer mounts at /etc/orbit-mail/relay.key. The
+# receive hook is started by Postfix as the orbitmail user, so the file
 # mounted for root is copied where that user can read it, and the variable is
 # re-pointed before supervisord (and so Postfix) inherits the environment.
-if [ -n "${ORBIT_RELAY_ENCRYPTION_KEY_FILE:-}" ]; then
-    if [ ! -r "${ORBIT_RELAY_ENCRYPTION_KEY_FILE}" ]; then
-        log "ERROR: ORBIT_RELAY_ENCRYPTION_KEY_FILE=${ORBIT_RELAY_ENCRYPTION_KEY_FILE} is not readable."
+if [ -z "${ORBIT_RELAY_ENCRYPTION_KEY:-}" ]; then
+    KEY_FILE="${ORBIT_RELAY_ENCRYPTION_KEY_FILE:-/etc/orbit-mail/relay.key}"
+    if [ ! -s "$KEY_FILE" ]; then
+        log "ERROR: no encryption key at ${KEY_FILE}. The relay never stores mail readable, so it will not start without one."
+        log "       Generate one on the host:  docker run --rm orbit-relay key generate | sudo tee /etc/orbit-mail/relay.key"
+        log "       then mount it:             -v /etc/orbit-mail/relay.key:/etc/orbit-mail/relay.key:ro"
+        log "       The installer (install.sh) does both."
         exit 1
     fi
-    install -o orbitmail -g orbitmail -m 0400 "${ORBIT_RELAY_ENCRYPTION_KEY_FILE}" "$STATE_DIR/relay.key"
+    install -o orbitmail -g orbitmail -m 0400 "$KEY_FILE" "$STATE_DIR/relay.key"
     export ORBIT_RELAY_ENCRYPTION_KEY_FILE="$STATE_DIR/relay.key"
-    log "Encryption is on; mail is sealed on this node before it reaches the server."
 fi
 
 if ! /opt/orbit-relay/bin/orbit-relay check; then
@@ -132,10 +144,5 @@ if ! /opt/orbit-relay/bin/orbit-relay check; then
     exit 1
 fi
 
-if [ "${1:-run}" = "run" ]; then
-    log "Starting supervisord"
-    exec /usr/bin/supervisord -n -c /app/deploy/supervisord.conf
-fi
-
-# Any other argument is a plain CLI command (status, check, ping, logs, dead).
-exec /opt/orbit-relay/bin/orbit-relay "$@"
+log "Starting supervisord"
+exec /usr/bin/supervisord -n -c /app/deploy/supervisord.conf

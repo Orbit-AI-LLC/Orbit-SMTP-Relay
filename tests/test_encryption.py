@@ -1,10 +1,11 @@
-"""Tests for the relay's optional encryption mode.
+"""Tests for the relay's encryption: sealing inbound mail to the reader's key
+and opening outgoing mail sealed to the node's own key.
 
 What matters here is the contract with the other two ends: the Orbit Mail
 server must receive something it can file without reading, and the browser
-must be able to open it with nothing but the shared key. So these tests check
-the stored and transmitted shapes, not only that encrypt followed by decrypt
-is the identity.
+must be able to open it with nothing but the reader's private key. So these
+tests check the stored and transmitted shapes, not only that seal followed by
+open is the identity.
 """
 
 import base64
@@ -13,14 +14,19 @@ import email.policy
 import json
 import os
 import tempfile
+import time
 import unittest
 
 from relay.config import Config
-from relay.crypto import ASSOCIATED_DATA, Cipher, EncryptionError, generate_key, key_id, load_cipher, parse_key, write_key_file
+from relay.crypto import (
+    ALGORITHM, ASSOCIATED_DATA, PUBLIC_KEY_BYTES, WRAP_INFO, Cipher, EncryptionError, generate_key, key_id, load_cipher,
+    parse_private_key, parse_public_key, public_key_of, scalar_from_seed, seal, write_key_file,
+)
+from relay.keys import KeyUnavailable, PublicKeyDirectory
 from relay.outbound import build_message, decode_item
 from relay.postfix import Maildrop, split_headers
 from relay.queue import Queue, QueuedMessage
-from relay.transport import MailServerClient, Response
+from relay.transport import MailServerClient, PermanentError, Response, RetryableError
 
 RAW = (
     "From: Bob <bob@example.org>\r\n"
@@ -34,104 +40,239 @@ RAW = (
 
 def make_config(**overrides):
     values = dict(node_name="relay-test", hostname="relay-test.example.com",
-                  server_url="https://mail.example.com", api_key="orbk_test", postfix_dir="")
+                  server_url="https://mail.example.com", api_key="orbk_test", postfix_dir="",
+                  encryption_key=generate_key())
     values.update(overrides)
     return Config(**values)
+
+
+class StaticKeys:
+    """A key directory that answers from a dict, like the server would."""
+
+    def __init__(self, **readers):
+        self.readers = {address: Cipher.from_text(text) for address, text in readers.items()}
+
+    def lookup(self, address):
+        reader = self.readers.get(address.lower())
+        if reader is None:
+            raise KeyUnavailable(f"{address} has not set an encryption key yet.")
+        return reader.kid, reader.public_key
 
 
 class KeyTests(unittest.TestCase):
     def test_generated_keys_are_recognisable_and_distinct(self):
         first, second = generate_key(), generate_key()
-        self.assertTrue(first.startswith("orbe_"))
+        self.assertTrue(first.startswith("orbp_"))
         self.assertNotEqual(first, second)
-        self.assertEqual(len(parse_key(first)), 32)
+        self.assertEqual(len(parse_private_key(first)), 32)
 
-    def test_key_id_is_short_and_stable(self):
-        raw = parse_key(generate_key())
-        self.assertEqual(key_id(raw), key_id(raw))
-        self.assertEqual(len(key_id(raw)), 12)
+    def test_key_id_comes_from_the_public_half(self):
+        seed = parse_private_key(generate_key())
+        public = public_key_of(seed)
+        self.assertEqual(len(public), PUBLIC_KEY_BYTES)
+        self.assertTrue(public.startswith(bytes.fromhex("3059301306072a8648ce3d020106082a8648ce3d030107034200")))
+        self.assertEqual(key_id(public), key_id(public))
+        self.assertEqual(len(key_id(public)), 12)
+        self.assertEqual(Cipher(seed).kid, key_id(public))
+
+    def test_the_seed_becomes_a_scalar_the_way_the_browser_does_it(self):
+        # seed mod (n - 1) + 1, so a derived key is never zero and the same
+        # seed gives the same key in Python and in e2ee.js.
+        self.assertEqual(scalar_from_seed(bytes(32)), 1)
+        self.assertEqual(scalar_from_seed(b"\xff" * 32), (2 ** 256 - 1) % (0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551 - 1) + 1)
+
+    def test_public_keys_parse_in_either_base64_alphabet(self):
+        public = public_key_of(parse_private_key(generate_key()))
+        standard = base64.b64encode(public).decode()
+        urlsafe = base64.urlsafe_b64encode(public).decode().rstrip("=")
+        self.assertEqual(parse_public_key(standard), public)
+        self.assertEqual(parse_public_key(urlsafe), public)
+        # The same SPKI form Orbit Chat stores for a person's identity.
+        from cryptography.hazmat.primitives import serialization
+
+        self.assertIsNotNone(serialization.load_der_public_key(public))
 
     def test_malformed_keys_are_rejected(self):
-        for bad in ("", "orbk_not-this-kind", "orbe_dG9vc2hvcnQ", "orbe_!!!"):
+        for bad in ("", "orbk_not-this-kind", "orbe_old-format", "orbp_dG9vc2hvcnQ", "orbp_!!!"):
             with self.subTest(bad=bad), self.assertRaises(EncryptionError):
-                parse_key(bad)
+                parse_private_key(bad)
+        off_curve = bytes.fromhex("3059301306072a8648ce3d020106082a8648ce3d030107034200") + b"\x04" + b"\x01" * 64
+        for bad in ("", "dG9vc2hvcnQ", "***", base64.b64encode(b"\x00" * 91).decode(), base64.b64encode(off_curve).decode()):
+            with self.subTest(bad=bad), self.assertRaises(EncryptionError):
+                parse_public_key(bad)
 
     def test_key_file_is_owner_only_and_not_clobbered(self):
         with tempfile.TemporaryDirectory() as root:
             path = os.path.join(root, "relay.key")
-            key = generate_key()
-            write_key_file(path, key)
+            write_key_file(path, generate_key())
             self.assertEqual(oct(os.stat(path).st_mode & 0o777), "0o600")
             with self.assertRaises(EncryptionError):
                 write_key_file(path, generate_key())
             write_key_file(path, generate_key(), overwrite=True)
-            config = make_config(encryption_key_file=path)
+            config = make_config(encryption_key="", encryption_key_file=path)
             self.assertIsNotNone(load_cipher(config))
             self.assertEqual(config.validate(), [])
 
-    def test_config_reports_an_unreadable_key_file(self):
-        problems = make_config(encryption_key_file="/nonexistent/relay.key").validate()
+    def test_config_reports_a_missing_or_unreadable_key(self):
+        problems = make_config(encryption_key="", encryption_key_file="/nonexistent/relay.key").validate()
         self.assertTrue(any("Encryption" in p for p in problems))
+        problems = make_config(encryption_key="", encryption_key_file="").validate()
+        self.assertTrue(any("required" in p for p in problems))
+        with self.assertRaises(EncryptionError):
+            load_cipher(make_config(encryption_key="", encryption_key_file=""))
 
-    def test_config_without_a_key_has_no_cipher(self):
-        self.assertIsNone(load_cipher(make_config()))
-        self.assertFalse(make_config().encryption_enabled)
 
-
-class CipherTests(unittest.TestCase):
+class SealTests(unittest.TestCase):
     def setUp(self):
-        self.cipher = Cipher.from_text(generate_key())
+        self.reader = Cipher.from_text(generate_key())
 
     def test_seal_and_open_round_trip(self):
-        envelope, ciphertext = self.cipher.seal(b"hello")
-        self.assertEqual(envelope["alg"], "A256GCM")
-        self.assertEqual(envelope["kid"], self.cipher.kid)
+        envelope, ciphertext = seal(b"hello", [(self.reader.kid, self.reader.public_key)])
+        self.assertEqual(envelope["v"], 2)
+        self.assertEqual(envelope["alg"], ALGORITHM)
+        self.assertEqual(envelope["kid"], self.reader.kid)
         self.assertEqual(len(base64.b64decode(envelope["nonce"])), 12)
-        self.assertEqual(self.cipher.open(envelope, ciphertext), b"hello")
+        self.assertEqual([k["kid"] for k in envelope["keys"]], [self.reader.kid])
+        self.assertEqual(self.reader.open(envelope, ciphertext), b"hello")
 
-    def test_each_message_gets_a_fresh_nonce(self):
-        first, _ = self.cipher.seal(b"x")
-        second, _ = self.cipher.seal(b"x")
+    def test_each_message_gets_fresh_parameters(self):
+        first, _ = seal(b"x", [(self.reader.kid, self.reader.public_key)])
+        second, _ = seal(b"x", [(self.reader.kid, self.reader.public_key)])
         self.assertNotEqual(first["nonce"], second["nonce"])
+        self.assertNotEqual(first["keys"][0]["epk"], second["keys"][0]["epk"])
+
+    def test_several_readers_can_open_one_ciphertext(self):
+        other = Cipher.from_text(generate_key())
+        envelope, ciphertext = seal(b"shared", [(self.reader.kid, self.reader.public_key), (other.kid, other.public_key)])
+        self.assertEqual(envelope["kid"], self.reader.kid)
+        self.assertEqual(self.reader.open(envelope, ciphertext), b"shared")
+        self.assertEqual(other.open(envelope, ciphertext), b"shared")
 
     def test_wrong_key_cannot_open(self):
-        envelope, ciphertext = self.cipher.seal(b"secret")
+        envelope, ciphertext = seal(b"secret", [(self.reader.kid, self.reader.public_key)])
         other = Cipher.from_text(generate_key())
         with self.assertRaises(EncryptionError):
-            other.open(dict(envelope, kid=other.kid), ciphertext)
-        with self.assertRaises(EncryptionError):
             other.open(envelope, ciphertext)
+        forged = dict(envelope, keys=[dict(envelope["keys"][0], kid=other.kid)])
+        with self.assertRaises(EncryptionError):
+            other.open(forged, ciphertext)
 
     def test_tampering_is_detected(self):
-        envelope, ciphertext = self.cipher.seal(b"secret")
+        envelope, ciphertext = seal(b"secret", [(self.reader.kid, self.reader.public_key)])
         raw = bytearray(base64.b64decode(ciphertext))
         raw[0] ^= 0x01
         with self.assertRaises(EncryptionError):
-            self.cipher.open(envelope, base64.b64encode(bytes(raw)).decode())
+            self.reader.open(envelope, base64.b64encode(bytes(raw)).decode())
+        wrapped = bytearray(base64.b64decode(envelope["keys"][0]["wk"]))
+        wrapped[0] ^= 0x01
+        tampered = dict(envelope, keys=[dict(envelope["keys"][0], wk=base64.b64encode(bytes(wrapped)).decode())])
+        with self.assertRaises(EncryptionError):
+            self.reader.open(tampered, ciphertext)
 
     def test_format_matches_webcrypto_expectations(self):
-        # The browser decrypts with AES-GCM, a 12-byte IV, a 128-bit tag at
-        # the end of the ciphertext and this exact associated data. Check the
-        # layout directly against the primitive so a refactor cannot drift.
+        # The browser does ECDH P-256 agreement with the ephemeral key (SPKI),
+        # HKDF-SHA256 with this info string, AES-GCM over the wrapped content
+        # key with the key id as associated data, then AES-GCM over the
+        # message with a 12-byte nonce, a 128-bit tag at the end and this
+        # associated data. Check the layout directly against the primitives
+        # so a refactor cannot drift from what e2ee.js implements.
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
         from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
-        envelope, ciphertext = self.cipher.seal(b"body")
-        nonce = base64.b64decode(envelope["nonce"])
+        envelope, ciphertext = seal(b"body", [(self.reader.kid, self.reader.public_key)])
+        entry = envelope["keys"][0]
+        ephemeral = base64.b64decode(entry["epk"])
+        self.assertEqual(len(ephemeral), PUBLIC_KEY_BYTES)
+        private = ec.derive_private_key(scalar_from_seed(self.reader._seed), ec.SECP256R1())
+        shared = private.exchange(ec.ECDH(), serialization.load_der_public_key(ephemeral))
+        kek = HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=WRAP_INFO + ephemeral + self.reader.public_key).derive(shared)
+        content_key = AESGCM(kek).decrypt(base64.b64decode(entry["iv"]), base64.b64decode(entry["wk"]), self.reader.kid.encode())
+        self.assertEqual(len(content_key), 32)
         data = base64.b64decode(ciphertext)
         self.assertEqual(len(data), len(b"body") + 16)
-        self.assertEqual(AESGCM(self.cipher._key).decrypt(nonce, data, ASSOCIATED_DATA), b"body")
+        self.assertEqual(AESGCM(content_key).decrypt(base64.b64decode(envelope["nonce"]), data, ASSOCIATED_DATA), b"body")
+
+
+class KeyDirectoryTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.reader = Cipher.from_text(generate_key())
+        self.client = MailServerClient(make_config())
+        self.requests = []
+        self.replies = []
+
+        def fake(url, *, method="POST", payload=None, headers=None, timeout=None):
+            self.requests.append(url)
+            reply = self.replies.pop(0)
+            if isinstance(reply, Exception):
+                raise reply
+            return reply
+
+        self.client.http.request = fake
+        self.directory = PublicKeyDirectory(self.client, os.path.join(self._tmp.name, "keys"), ttl=600, missing_ttl=60)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def found(self):
+        return Response(200, json.dumps({"address": "alice@example.com", "kid": self.reader.kid, "public_key": self.reader.public_key_text}), {})
+
+    def test_fetches_once_then_serves_from_cache(self):
+        self.replies.append(self.found())
+        self.assertEqual(self.directory.lookup("Alice@example.com"), (self.reader.kid, self.reader.public_key))
+        self.assertEqual(self.directory.lookup("alice@example.com"), (self.reader.kid, self.reader.public_key))
+        self.assertEqual(len(self.requests), 1)
+        self.assertIn("address=alice%40example.com", self.requests[0])
+        self.assertTrue(self.requests[0].startswith("https://mail.example.com/api/relay/keys/"))
+
+    def test_reader_without_a_key_is_retryable_and_remembered_briefly(self):
+        self.replies.append(PermanentError("HTTP 404: no key", status=404))
+        with self.assertRaises(KeyUnavailable) as caught:
+            self.directory.lookup("alice@example.com")
+        self.assertTrue(caught.exception.retryable)
+        with self.assertRaises(KeyUnavailable):
+            self.directory.lookup("alice@example.com")
+        self.assertEqual(len(self.requests), 1)
+
+    def test_forbidden_mailbox_is_not_retryable(self):
+        self.replies.append(PermanentError("HTTP 403: not yours", status=403))
+        with self.assertRaises(KeyUnavailable) as caught:
+            self.directory.lookup("alice@example.com")
+        self.assertFalse(caught.exception.retryable)
+
+    def test_server_outage_uses_a_recent_key_and_otherwise_defers(self):
+        self.replies.append(RetryableError("down"))
+        with self.assertRaises(KeyUnavailable) as caught:
+            self.directory.lookup("alice@example.com")
+        self.assertTrue(caught.exception.retryable)
+        self.replies.append(self.found())
+        self.directory.lookup("alice@example.com")
+        # Expire the cache, then take the server away: the stale key still serves.
+        self.directory.ttl = 0
+        time.sleep(0.01)
+        self.replies.append(RetryableError("down"))
+        self.assertEqual(self.directory.lookup("alice@example.com"), (self.reader.kid, self.reader.public_key))
+
+    def test_mismatched_key_id_is_refused(self):
+        self.replies.append(Response(200, json.dumps({"kid": "000000000000", "public_key": self.reader.public_key_text}), {}))
+        with self.assertRaises(KeyUnavailable) as caught:
+            self.directory.lookup("alice@example.com")
+        self.assertFalse(caught.exception.retryable)
 
 
 class InboundEncryptionTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.root = self._tmp.name
-        self.cipher = Cipher.from_text(generate_key())
+        self.reader_text = generate_key()
+        self.reader = Cipher.from_text(self.reader_text)
         self.queue = Queue(os.path.join(self.root, "queue"))
         self.queue.ensure_dirs()
         self.maildrop_dir = os.path.join(self.root, "incoming")
         os.makedirs(self.maildrop_dir)
-        self.maildrop = Maildrop(self.maildrop_dir, self.queue, "relay-test", cipher=self.cipher)
+        self.maildrop = Maildrop(self.maildrop_dir, self.queue, "relay-test", keys=StaticKeys(**{"alice@example.com": self.reader_text}))
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -140,9 +281,17 @@ class InboundEncryptionTests(unittest.TestCase):
         with open(os.path.join(self.maildrop_dir, name), "w") as handle:
             handle.write(raw)
         claimed = self.maildrop.claim(name)
-        message = self.maildrop.process_file(claimed)
+        try:
+            message = self.maildrop.process_file(claimed)
+        except Exception:
+            self.maildrop.release(claimed)
+            raise
         self.maildrop.discard(claimed)
         return message
+
+    def test_maildrop_refuses_to_exist_without_keys(self):
+        with self.assertRaises(EncryptionError):
+            Maildrop(self.maildrop_dir, self.queue, "relay-test")
 
     def test_split_headers(self):
         head, body = split_headers(b"A: 1\r\nB: 2\r\n\r\nbody\r\n")
@@ -155,6 +304,7 @@ class InboundEncryptionTests(unittest.TestCase):
         self.assertTrue(message.is_encrypted)
         self.assertEqual(message.recipient, "alice@example.com")
         self.assertEqual(message.encoding, "base64")
+        self.assertEqual(message.encryption["kid"], self.reader.kid)
         self.assertIn("Subject: Lunch", message.headers)
         self.assertNotIn("Noon?", message.headers)
         self.assertFalse(message.has_attachments)
@@ -162,7 +312,14 @@ class InboundEncryptionTests(unittest.TestCase):
         with open(os.path.join(self.queue.pending_dir, f"{message.id}.json"), "rb") as handle:
             on_disk = handle.read()
         self.assertNotIn(b"Noon?", on_disk)
-        self.assertEqual(self.cipher.open(message.encryption, message.raw), RAW.encode())
+        self.assertEqual(self.reader.open(message.encryption, message.raw), RAW.encode())
+
+    def test_reader_without_a_key_is_not_queued(self):
+        with self.assertRaises(KeyUnavailable):
+            self.accept(name="nobody@example.com")
+        self.assertEqual(self.queue.stats()["pending"], 0)
+        # The drop file is back where Postfix left it, for the next attempt.
+        self.assertTrue(os.path.exists(os.path.join(self.maildrop_dir, "nobody@example.com")))
 
     def test_attachments_are_flagged_without_being_read(self):
         raw = (
@@ -198,24 +355,28 @@ class InboundEncryptionTests(unittest.TestCase):
         self.assertEqual(seen["encoding"], "base64")
         self.assertEqual(seen["size"], len(RAW))
         self.assertNotIn("Noon?", base64.b64decode(seen["raw"]).decode("latin-1"))
-        self.assertEqual(self.cipher.open(seen["encrypted"], seen["raw"]), RAW.encode())
+        self.assertEqual(self.reader.open(seen["encrypted"], seen["raw"]), RAW.encode())
 
-    def test_old_queue_files_without_the_new_fields_still_load(self):
-        legacy = QueuedMessage.from_dict({"id": "abc", "recipient": "a@b.c", "raw": RAW})
+    def test_readable_queue_files_are_parked_not_posted(self):
+        legacy = QueuedMessage(id="legacy1", recipient="alice@example.com", raw=RAW)
         self.assertFalse(legacy.is_encrypted)
-        self.assertEqual(legacy.encoding, "")
+        client = MailServerClient(make_config())
+        client.http.request = lambda *a, **k: self.fail("a readable message must never be posted")
+        with self.assertRaises(PermanentError):
+            client.deliver(legacy)
 
 
 class OutboundEncryptionTests(unittest.TestCase):
     def setUp(self):
-        self.cipher = Cipher.from_text(generate_key())
+        self.node = Cipher.from_text(generate_key())
+        self.author = Cipher.from_text(generate_key())
 
-    def compose_item(self, cipher=None, **extra):
-        cipher = cipher or self.cipher
+    def compose_item(self, readers=None, **extra):
         document = {"body": "Hello from the browser", "attachments": [
             {"filename": "note.txt", "content_type": "text/plain", "data_base64": base64.b64encode(b"note").decode()},
         ]}
-        envelope, ciphertext = cipher.seal(json.dumps(document).encode())
+        readers = readers or [(self.author.kid, self.author.public_key), (self.node.kid, self.node.public_key)]
+        envelope, ciphertext = seal(json.dumps(document).encode(), readers)
         item = {
             "id": "ob-1", "envelope_from": "ada@example.com", "recipients": ["bob@example.org"],
             "raw_base64": ciphertext, "encrypted": envelope, "format": "compose",
@@ -226,7 +387,7 @@ class OutboundEncryptionTests(unittest.TestCase):
         return item
 
     def test_build_message_from_decrypted_document(self):
-        raw = decode_item(self.compose_item(), self.cipher)
+        raw = decode_item(self.compose_item(), self.node)
         parsed = email.message_from_bytes(raw, policy=email.policy.default)
         self.assertEqual(parsed["Subject"], "Sealed")
         self.assertEqual(parsed["Message-ID"], "<x@example.com>")
@@ -242,41 +403,45 @@ class OutboundEncryptionTests(unittest.TestCase):
         self.assertTrue(parsed["Message-ID"].endswith("@example.com>"))
 
     def test_plain_items_are_untouched(self):
-        self.assertEqual(decode_item({"raw_base64": base64.b64encode(b"hi").decode()}, self.cipher), b"hi")
+        self.assertEqual(decode_item({"raw_base64": base64.b64encode(b"hi").decode()}, self.node), b"hi")
         self.assertEqual(decode_item({"raw": "hi"}, None), b"hi")
 
     def test_mime_format_is_passed_through(self):
-        envelope, ciphertext = self.cipher.seal(RAW.encode())
-        self.assertEqual(decode_item({"raw_base64": ciphertext, "encrypted": envelope, "format": "mime"}, self.cipher), RAW.encode())
+        envelope, ciphertext = seal(RAW.encode(), [(self.node.kid, self.node.public_key)])
+        self.assertEqual(decode_item({"raw_base64": ciphertext, "encrypted": envelope, "format": "mime"}, self.node), RAW.encode())
 
     def test_missing_or_wrong_key_raises(self):
         with self.assertRaises(EncryptionError):
             decode_item(self.compose_item(), None)
+        only_author = self.compose_item(readers=[(self.author.kid, self.author.public_key)])
         with self.assertRaises(EncryptionError):
-            decode_item(self.compose_item(), Cipher.from_text(generate_key()))
+            decode_item(only_author, self.node)
 
-    def test_agent_defers_when_it_lacks_the_key_and_sends_when_it_has_it(self):
+    def test_agent_defers_when_not_sealed_to_it_and_sends_when_it_is(self):
         from tests.test_end_to_end import FakeSendmail, ScriptedServer
         from relay.agent import RelayAgent
 
         with tempfile.TemporaryDirectory() as root:
             fake = FakeSendmail(root)
             config = make_config(queue_dir=os.path.join(root, "q"), maildrop_dir=os.path.join(root, "m"),
-                                 sendmail_path=fake.path, log_backend="memory")
+                                 state_dir=os.path.join(root, "s"), sendmail_path=fake.path, log_backend="memory")
             server = ScriptedServer()
             server.queue_reply((200, json.dumps({"id": "ob-1", "status": "deferred"})))
             agent = RelayAgent(config=config, cipher=Cipher.from_text(generate_key()))
             agent.server.http.request = server
             self.assertEqual(agent.send_one(self.compose_item()), "deferred")
-            self.assertIn("not", server.requests[0]["payload"]["error"])
+            self.assertIn("not sealed", server.requests[0]["payload"]["error"])
 
             server.queue_reply((200, json.dumps({"id": "ob-1", "status": "sent"})))
-            agent = RelayAgent(config=config, cipher=self.cipher)
+            agent = RelayAgent(config=config, cipher=self.node)
             agent.server.http.request = server
             self.assertEqual(agent.send_one(self.compose_item()), "sent")
             self.assertIn("Hello from the browser", fake.read())
-            self.assertEqual(agent.status()["encryption"]["kid"], self.cipher.kid)
-            self.assertEqual(agent.status_report()["encryption_kid"], self.cipher.kid)
+            self.assertEqual(agent.status()["encryption"]["kid"], self.node.kid)
+            self.assertEqual(agent.status()["encryption"]["public_key"], self.node.public_key_text)
+            report = agent.status_report()
+            self.assertEqual(report["encryption_kid"], self.node.kid)
+            self.assertEqual(report["encryption_public_key"], self.node.public_key_text)
 
 
 if __name__ == "__main__":

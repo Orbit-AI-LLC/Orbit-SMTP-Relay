@@ -9,8 +9,10 @@ The pipeline is a pipe, not a socket:
    agent's ``receive`` command.
 2. The agent claims the file with an atomic rename, the same pattern the queue
    uses, so two Postfix workers cannot both pick up the same message.
-3. The message is put on the durable queue *first*, and only then does the
-   agent tell Postfix the message was accepted.
+3. The message is sealed to the reader's public key, fetched from the Orbit
+   Mail server, and put on the durable queue *first*; only then does the
+   agent tell Postfix it was accepted. A reader without a key yet means the
+   message is deferred, never queued readable.
 
 That ordering is the whole point. Once Postfix is told the message was
 accepted, Postfix considers its job done and will not retry. So the agent
@@ -26,6 +28,7 @@ import email.policy
 import logging
 import os
 
+from .crypto import EncryptionError, seal
 from .queue import QueuedMessage
 
 logger = logging.getLogger(__name__)
@@ -67,13 +70,19 @@ MAX_MESSAGE_BYTES = 50 * 1024 * 1024
 class Maildrop:
     """Reads messages Postfix has written, and reports delivery verdicts."""
 
-    def __init__(self, directory, queue, node_name="", cipher=None):
+    def __init__(self, directory, queue, node_name="", keys=None):
+        if keys is None:
+            # There is no readable mode. Refusing here, rather than at the
+            # first message, keeps a misconfigured node from accepting mail
+            # it would then have to hold.
+            raise EncryptionError("The maildrop needs a key directory; mail is never queued readable.")
         self.directory = os.path.abspath(directory)
         self.queue = queue
         self.node_name = node_name
-        #: When set, messages are encrypted before they are queued, so the
+        #: ``lookup(address) -> (kid, raw_public)``, raising KeyUnavailable.
+        #: Every message is sealed to its reader before it is queued, so the
         #: plaintext never rests on disk and never reaches the server.
-        self.cipher = cipher
+        self.keys = keys
         self.processing_dir = os.path.join(self.directory, ".processing")
         os.makedirs(self.processing_dir, exist_ok=True)
 
@@ -119,7 +128,8 @@ class Maildrop:
 
         Returns the queued message. Raises ValueError for a message that is
         too large or has no usable envelope recipient, which the caller turns
-        into an SMTP rejection.
+        into an SMTP rejection, and KeyUnavailable when the reader's public
+        key cannot be had right now, which the caller turns into a deferral.
         """
         size = os.path.getsize(path)
         if size > MAX_MESSAGE_BYTES:
@@ -137,21 +147,19 @@ class Maildrop:
             relay_host=self.node_name,
             received_at=_now_iso(),
         )
-        if self.cipher is not None:
-            # The whole message is sealed so the browser can parse it in
-            # full. The header block travels readable beside it: the server
-            # needs From, To, Subject and the threading headers to file the
-            # message, and they are the part a mail relay sees anyway.
-            header_block, _body = split_headers(raw_bytes)
-            envelope, ciphertext = self.cipher.seal(raw_bytes)
-            message.raw = ciphertext
-            message.encoding = "base64"
-            message.encryption = envelope
-            message.headers = header_block.decode("utf-8", errors="replace")
-            message.has_attachments = has_attachments(parsed)
-            message.plain_size = size
-        else:
-            message.raw = raw_bytes.decode("utf-8", errors="replace")
+        # The whole message is sealed to the reader's key so the browser can
+        # parse it in full. The header block travels readable beside it: the
+        # server needs From, To, Subject and the threading headers to file
+        # the message, and they are the part a mail relay sees anyway.
+        kid, raw_public = self.keys.lookup(recipient)
+        header_block, _body = split_headers(raw_bytes)
+        envelope, ciphertext = seal(raw_bytes, [(kid, raw_public)])
+        message.raw = ciphertext
+        message.encoding = "base64"
+        message.encryption = envelope
+        message.headers = header_block.decode("utf-8", errors="replace")
+        message.has_attachments = has_attachments(parsed)
+        message.plain_size = size
         # Durability first: Postfix is about to be told this was accepted.
         self.queue.enqueue(message)
         return message

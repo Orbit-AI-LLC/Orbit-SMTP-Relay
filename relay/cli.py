@@ -18,6 +18,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from .agent import RelayAgent
 from .config import load_config
 from .crypto import EncryptionError, generate_key, load_cipher, load_key_text, write_key_file
+from .keys import KeyUnavailable, PublicKeyDirectory
 from .logging_setup import recent_events, setup_logging
 from .queue import Queue
 
@@ -40,13 +41,14 @@ def _build_parser():
     dead = subparsers.add_parser("dead", help="List messages parked after exhausting retries.")
     dead.add_argument("--limit", type=int, default=20)
 
-    key = subparsers.add_parser("key", help="Manage the optional encryption key.")
+    key = subparsers.add_parser("key", help="Manage the node's encryption key.")
     key_commands = key.add_subparsers(dest="key_command", required=True)
     generate = key_commands.add_parser("generate", help="Print a new encryption key, or write it to a file.")
     generate.add_argument("--write", metavar="PATH", help="Write the key to this file (mode 0600) instead of printing it.")
     generate.add_argument("--force", action="store_true", help="Replace an existing key file.")
-    show = key_commands.add_parser("show", help="Print the configured key so it can be pasted into Orbit Mail.")
-    show.add_argument("--id-only", action="store_true", help="Print only the key id, which is safe to share.")
+    show = key_commands.add_parser("show", help="Print this node's public key and key id.")
+    show.add_argument("--id-only", action="store_true", help="Print only the key id.")
+    show.add_argument("--private", action="store_true", help="Print the private key instead, for copying to another node.")
 
     return parser
 
@@ -92,15 +94,14 @@ def cmd_receive(args):
         backoff_jitter=config.backoff_jitter,
     )
     from .postfix import Maildrop
+    from .transport import MailServerClient
 
-    try:
-        cipher = load_cipher(config)
-    except EncryptionError as error:
-        # Refusing is right: accepting the message unencrypted would send
-        # plaintext to a server the operator chose not to trust with it.
-        logger.error("Encryption key problem, deferring %s: %s", args.filename, error)
-        return 75
-    maildrop = Maildrop(config.maildrop_dir, queue, config.node_name, cipher=cipher)
+    client = MailServerClient(config)
+    keys = PublicKeyDirectory(
+        client, os.path.join(config.state_dir, "keys"),
+        ttl=config.key_cache_seconds, missing_ttl=config.missing_key_cache_seconds,
+    )
+    maildrop = Maildrop(config.maildrop_dir, queue, config.node_name, keys=keys)
 
     path = maildrop.claim(args.filename)
     if path is None:
@@ -113,6 +114,16 @@ def cmd_receive(args):
         logger.error("Rejecting %s: %s", args.filename, error)
         maildrop.discard(path)
         return 67  # EX_NOUSER
+    except KeyUnavailable as error:
+        # There is no readable mode. Without the reader's key the message
+        # waits in Postfix's queue (deferred) until the reader sets one, or
+        # bounces (rejected) when this node may never deliver to that mailbox.
+        maildrop.release(path)
+        if error.retryable:
+            logger.warning("Deferring %s: %s", args.filename, error)
+            return 75  # EX_TEMPFAIL
+        logger.error("Rejecting %s: %s", args.filename, error)
+        return 67
     except Exception:
         logger.exception("Failed to accept %s", args.filename)
         maildrop.release(path)
@@ -137,13 +148,11 @@ def cmd_status(args):
 
 
 def _encryption_summary(config):
-    if not config.encryption_enabled:
-        return {"enabled": False, "kid": ""}
     try:
         cipher = load_cipher(config)
     except EncryptionError as error:
-        return {"enabled": True, "kid": "", "error": str(error)}
-    return {"enabled": True, "kid": cipher.kid}
+        return {"enabled": True, "kid": "", "public_key": "", "error": str(error)}
+    return {"enabled": True, "kid": cipher.kid, "public_key": cipher.public_key_text}
 
 
 def cmd_check(args):
@@ -155,11 +164,7 @@ def cmd_check(args):
         print("WARNING: ORBIT_RELAY_API_KEY is not set; the node cannot reach the server.")
     if problems:
         return 1
-    summary = _encryption_summary(config)
-    if summary["enabled"]:
-        print(f"Encryption is on (key id {summary['kid']}).")
-    else:
-        print("Encryption is off; mail is stored readable on the Orbit Mail server.")
+    print(f"This node's key id is {_encryption_summary(config)['kid']}; inbound mail is sealed to each reader's key.")
     print("Configuration is usable.")
     return 0
 
@@ -207,7 +212,7 @@ def cmd_key(args):
             from .crypto import Cipher
 
             print(f"Wrote a new encryption key to {args.write} (key id {Cipher.from_text(key_text).kid}).")
-            print("Keep a copy somewhere safe: without it the mail this node encrypts cannot be read.")
+            print("Keep a copy somewhere safe: outgoing mail sealed to this node needs it to be sent.")
             return 0
         print(key_text)
         return 0
@@ -215,9 +220,6 @@ def cmd_key(args):
     config = load_config()
     try:
         key_text = load_key_text(config)
-        if not key_text:
-            print("Encryption is not configured on this node.", file=sys.stderr)
-            return 1
         from .crypto import Cipher
 
         cipher = Cipher.from_text(key_text)
@@ -226,8 +228,11 @@ def cmd_key(args):
         return 1
     if args.id_only:
         print(cipher.kid)
-    else:
+    elif args.private:
         print(key_text)
+    else:
+        print(f"key id     {cipher.kid}")
+        print(f"public key {cipher.public_key_text}")
     return 0
 
 

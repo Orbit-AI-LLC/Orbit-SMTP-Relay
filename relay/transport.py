@@ -15,7 +15,6 @@ treats them differently:
 
 from __future__ import annotations
 
-import base64
 import json
 import socket
 import ssl
@@ -23,7 +22,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 
-USER_AGENT = "OrbitMailRelay/2.1"
+USER_AGENT = "OrbitMailRelay/3.0"
 
 
 class TransportError(Exception):
@@ -127,9 +126,15 @@ class MailServerClient:
     def deliver(self, message):
         """Post one inbound message. Raises RetryableError or PermanentError.
 
-        The raw bytes travel base64-encoded so a message with any byte sequence
-        survives the trip intact; the server stores the original.
+        Only ciphertext ever leaves the node. ``raw`` is the base64 ciphertext
+        the receive hook produced; the server stores it as it is and files the
+        message from the readable header block beside it.
         """
+        if not getattr(message, "is_encrypted", False):
+            # Cannot happen through the receive hook, which seals every
+            # message. A queue file edited by hand, or one written by a
+            # release before 3.0, is parked rather than posted readable.
+            raise PermanentError("Refusing to post a readable message; the relay only delivers sealed mail.", code="not_encrypted")
         payload = {
             "message_id": message.id,
             "recipient": message.recipient,
@@ -137,20 +142,12 @@ class MailServerClient:
             "encoding": "base64",
             "received_at": message.received_at,
             "relay_node": self.config.node_name,
+            "raw": message.raw,
+            "encrypted": dict(message.encryption),
+            "headers": message.headers,
+            "has_attachments": bool(message.has_attachments),
+            "size": int(message.plain_size or 0),
         }
-        if getattr(message, "is_encrypted", False):
-            # Already base64 ciphertext; the server stores it as it is and
-            # files the message from the readable header block.
-            payload["raw"] = message.raw
-            payload["encrypted"] = dict(message.encryption)
-            payload["headers"] = message.headers
-            payload["has_attachments"] = bool(message.has_attachments)
-            payload["size"] = int(message.plain_size or 0)
-        else:
-            raw = message.raw
-            if isinstance(raw, str):
-                raw = raw.encode("utf-8", errors="surrogateescape")
-            payload["raw"] = base64.b64encode(raw).decode("ascii")
         response = self.http.request(self._url(self.config.inbound_path), payload=payload, headers=self._headers())
         body = response.json()
         if body.get("retryable") is False:
@@ -175,3 +172,24 @@ class MailServerClient:
     def health(self):
         """A cheap liveness probe used by the status endpoint."""
         return self.http.request(self._url(self.config.health_path), method="GET", timeout=5.0)
+
+    def fetch_public_key(self, address):
+        """The reader's public key for ``address``: ``{address, kid, public_key}``.
+
+        Returns None when the mailbox exists but its owner has not set a key
+        yet. Raises PermanentError when this node's API key may not deliver
+        to that mailbox, RetryableError when the server cannot be reached.
+        """
+        from urllib.parse import urlencode
+
+        url = self._url(self.config.keys_path) + "?" + urlencode({"address": address})
+        try:
+            response = self.http.request(url, method="GET", headers=self._headers())
+        except PermanentError as error:
+            if error.status == 404:
+                return None
+            raise
+        body = response.json()
+        if not body.get("public_key"):
+            return None
+        return body

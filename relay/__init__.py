@@ -11,4 +11,4 @@ synchronous step that can fail and be forgotten: every message enters a durable
 queue on disk first, and the queue is drained independently.
 """
 
-__version__ = "2.1.0"
+__version__ = "3.0.0"

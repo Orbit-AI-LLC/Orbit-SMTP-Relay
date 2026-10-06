@@ -19,6 +19,7 @@ import time
 import unittest
 
 from relay.config import Config
+from relay.crypto import Cipher, generate_key
 from relay.outbound import Sender, decode_raw
 from relay.postfix import Maildrop
 from relay.postfix_config import PostfixTables
@@ -37,7 +38,8 @@ RAW = (
 
 def make_config(**overrides):
     values = dict(node_name="relay-test", hostname="relay-test.example.com",
-                  server_url="https://mail.example.com", api_key="orbk_test", postfix_dir="")
+                  server_url="https://mail.example.com", api_key="orbk_test", postfix_dir="",
+                  encryption_key=generate_key())
     values.update(overrides)
     return Config(**values)
 
@@ -64,15 +66,27 @@ class ScriptedServer:
         return Response(status, body, {})
 
 
+class AnyReader:
+    """A key directory that gives every address the same reader, for tests
+    about the pipeline rather than about keys."""
+
+    def __init__(self):
+        self.reader = Cipher.from_text(generate_key())
+
+    def lookup(self, address):
+        return self.reader.kid, self.reader.public_key
+
+
 class Harness:
-    """Drives one message through accept → queue → deliver."""
+    """Drives one message through accept, seal, queue and deliver."""
 
     def __init__(self, root, server):
         self.maildrop_dir = os.path.join(root, "incoming")
         os.makedirs(self.maildrop_dir, exist_ok=True)
         self.queue = Queue(os.path.join(root, "queue"), max_attempts=3, backoff_base=0.0, backoff_max=0.0, backoff_jitter=0.0)
         self.queue.ensure_dirs()
-        self.maildrop = Maildrop(self.maildrop_dir, self.queue, "relay-test")
+        self.keys = AnyReader()
+        self.maildrop = Maildrop(self.maildrop_dir, self.queue, "relay-test", keys=self.keys)
         self.server = server
         self.client = MailServerClient(make_config())
         self.client.http.request = server
@@ -126,7 +140,10 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(request["headers"]["X-Orbit-Relay-Node"], "relay-test")
         self.assertEqual(request["payload"]["recipient"], "alice@example.com")
         self.assertEqual(request["payload"]["encoding"], "base64")
-        self.assertEqual(base64.b64decode(request["payload"]["raw"]).decode(), RAW)
+        # Only ciphertext travels; the reader's key opens it.
+        self.assertNotIn("Noon?", base64.b64decode(request["payload"]["raw"]).decode("latin-1"))
+        self.assertEqual(self.h.keys.reader.open(request["payload"]["encrypted"], request["payload"]["raw"]), RAW.encode())
+        self.assertIn("Subject: Lunch", request["payload"]["headers"])
         self.assertEqual(request["payload"]["message_id"], message.id)
 
     def test_retries_until_the_server_recovers(self):
@@ -229,7 +246,7 @@ class OutboundTests(unittest.TestCase):
 
         fake = FakeSendmail(self._tmp.name)
         config = make_config(queue_dir=os.path.join(self._tmp.name, "q"), maildrop_dir=os.path.join(self._tmp.name, "m"),
-                             sendmail_path=fake.path, log_backend="memory")
+                             state_dir=os.path.join(self._tmp.name, "s"), sendmail_path=fake.path, log_backend="memory")
         server = ScriptedServer()
         raw = base64.b64encode(b"Subject: Out\r\n\r\nBye\r\n").decode()
         server.queue_reply(
@@ -264,7 +281,7 @@ class HeartbeatTests(unittest.TestCase):
 
         postfix_dir = os.path.join(self._tmp.name, "postfix")
         config = make_config(queue_dir=os.path.join(self._tmp.name, "q"), maildrop_dir=os.path.join(self._tmp.name, "m"),
-                             postfix_dir=postfix_dir, log_backend="memory")
+                             state_dir=os.path.join(self._tmp.name, "s"), postfix_dir=postfix_dir, log_backend="memory")
         server = ScriptedServer()
         server.queue_reply((200, json.dumps({
             "domains": ["example.com"], "recipients": ["ada@example.com", "bob@example.com"], "catch_all_domains": ["example.com"],
@@ -282,6 +299,8 @@ class HeartbeatTests(unittest.TestCase):
         sent = server.requests[0]["payload"]
         self.assertEqual(sent["node"], "relay-test")
         self.assertIn("queue", sent)
+        self.assertEqual(sent["encryption_kid"], agent.cipher.kid)
+        self.assertEqual(sent["encryption_public_key"], agent.cipher.public_key_text)
         with open(os.path.join(postfix_dir, "relay_domains")) as handle:
             self.assertEqual(handle.read(), "example.com\tOK\n")
         with open(os.path.join(postfix_dir, "relay_recipients")) as handle:
@@ -306,16 +325,21 @@ class ConfigTests(unittest.TestCase):
         self.assertTrue(any("http" in p for p in problems))
 
     def test_valid_config_has_no_problems(self):
-        self.assertEqual(Config(node_name="relay-1", server_url="https://m.example.com").validate(), [])
+        self.assertEqual(Config(node_name="relay-1", server_url="https://m.example.com", encryption_key=generate_key()).validate(), [])
+
+    def test_a_node_without_its_own_key_is_unusable(self):
+        problems = Config(node_name="relay-1", server_url="https://m.example.com", encryption_key="", encryption_key_file="").validate()
+        self.assertTrue(any("key is required" in p for p in problems))
 
     def test_backoff_max_below_base_is_rejected(self):
-        config = Config(node_name="r", server_url="https://m", backoff_base=10, backoff_max=5)
+        config = Config(node_name="r", server_url="https://m", backoff_base=10, backoff_max=5, encryption_key=generate_key())
         self.assertTrue(any("ORBIT_BACKOFF_MAX" in p for p in config.validate()))
 
     def test_environment_is_read(self):
         os.environ["ORBIT_RELAY_NAME"] = "relay-env"
         os.environ["ORBIT_MAIL_SERVER_URL"] = "https://mail.example.com/"
         os.environ["ORBIT_RELAY_API_KEY"] = "orbk_abc"
+        os.environ["ORBIT_RELAY_ENCRYPTION_KEY"] = generate_key()
         try:
             from relay.config import load_config
 
@@ -325,7 +349,7 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config.validate(), [])
             self.assertTrue(config.has_api_key)
         finally:
-            for key in ("ORBIT_RELAY_NAME", "ORBIT_MAIL_SERVER_URL", "ORBIT_RELAY_API_KEY"):
+            for key in ("ORBIT_RELAY_NAME", "ORBIT_MAIL_SERVER_URL", "ORBIT_RELAY_API_KEY", "ORBIT_RELAY_ENCRYPTION_KEY"):
                 del os.environ[key]
 
     def test_memory_logging_is_bounded(self):

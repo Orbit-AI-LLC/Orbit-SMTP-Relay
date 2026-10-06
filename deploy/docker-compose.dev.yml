@@ -20,10 +20,11 @@ services:
       ORBIT_LOG_BACKEND: memory
       ORBIT_BACKOFF_BASE: "2"
       ORBIT_MAX_RETRY_HOURS: "1"
-      # Uncomment to try the encryption mode: generate a key with
+      # Required: the relay seals every message. Generate a key with
       #   python3 -m relay.cli key generate
-      # and paste it into Orbit Mail under Settings, Encryption.
-      # ORBIT_RELAY_ENCRYPTION_KEY: "orbe_..."
+      # export it as ORBIT_RELAY_ENCRYPTION_KEY, and paste the same key into
+      # Orbit Mail under Settings, Encryption.
+      ORBIT_RELAY_ENCRYPTION_KEY: "${ORBIT_RELAY_ENCRYPTION_KEY:?generate one with: python3 -m relay.cli key generate}"
     ports:
       - "2525:25"
       - "127.0.0.1:8080:8080"

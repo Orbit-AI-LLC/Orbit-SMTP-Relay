@@ -6,12 +6,15 @@ easy to work on:
 - **Open an issue first** for anything bigger than a bug fix, so the design
   can be discussed before the code is written.
 - **No new runtime dependencies.** The agent runs on the Python standard
-  library; the only optional package is `cryptography`, for the encryption
-  mode. A relay node has to be rebuildable years from now.
+  library plus `cryptography`, which seals every message. A relay node has to
+  be rebuildable years from now.
+- **No readable mode.** Every message is encrypted on the node before it is
+  queued or posted. A change that lets plaintext reach the server, even as an
+  option, will not be merged.
 - **Tests run with one command** and need no Postfix or network:
 
   ```bash
-  python3 -m pip install cryptography   # once, for the encryption tests
+  python3 -m pip install cryptography   # once
   python3 -m unittest discover -s tests
   ```
 

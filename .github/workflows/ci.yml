@@ -17,7 +17,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-      - name: Install the optional encryption dependency
+      - name: Install the agent's one dependency
         run: python -m pip install --upgrade pip cryptography
       - name: Run the test suite
         run: python -m unittest discover -s tests -v
@@ -43,5 +43,10 @@ jobs:
         run: docker build -t orbit-relay:ci .
       - name: Smoke test the CLI inside the image
         run: |
-          docker run --rm -e ORBIT_MAIL_SERVER_URL=https://mail.example.com orbit-relay:ci check
-          docker run --rm orbit-relay:ci key generate | grep -q '^orbe_'
+          key="$(docker run --rm orbit-relay:ci key generate)"
+          echo "$key" | grep -q '^orbp_'
+          docker run --rm -e ORBIT_MAIL_SERVER_URL=https://mail.example.com -e ORBIT_RELAY_ENCRYPTION_KEY="$key" orbit-relay:ci check
+          # Without a key the node must refuse to run.
+          if docker run --rm -e ORBIT_MAIL_SERVER_URL=https://mail.example.com orbit-relay:ci check; then
+            echo "check passed without an encryption key" >&2; exit 1
+          fi

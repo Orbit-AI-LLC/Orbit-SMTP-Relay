@@ -27,6 +27,7 @@ import urllib.request
 
 from .config import load_config
 from .crypto import EncryptionError, load_cipher
+from .keys import PublicKeyDirectory
 from .outbound import Sender, decode_item
 from .postfix import Maildrop
 from .postfix_config import PostfixTables
@@ -40,7 +41,7 @@ POLL_INTERVAL = 1.0
 
 
 class RelayAgent:
-    def __init__(self, config=None, server=None, sender=None, tables=None, cipher=None):
+    def __init__(self, config=None, server=None, sender=None, tables=None, cipher=None, keys=None):
         self.config = config or load_config()
         from .logging_setup import setup_logging
 
@@ -61,9 +62,15 @@ class RelayAgent:
         )
         self.queue.ensure_dirs()
 
+        # Raises EncryptionError when the node has no key: there is no
+        # readable mode, so the agent cannot be built without one.
         self.cipher = cipher or load_cipher(self.config)
-        self.maildrop = Maildrop(self.config.maildrop_dir, self.queue, self.config.node_name, cipher=self.cipher)
         self.server = server or MailServerClient(self.config)
+        self.keys = keys or PublicKeyDirectory(
+            self.server, os.path.join(self.config.state_dir, "keys"),
+            ttl=self.config.key_cache_seconds, missing_ttl=self.config.missing_key_cache_seconds,
+        )
+        self.maildrop = Maildrop(self.config.maildrop_dir, self.queue, self.config.node_name, keys=self.keys)
         self.sender = sender or Sender(self.config.sendmail_path)
         self.tables = tables or PostfixTables(self.config.postfix_dir)
 
@@ -107,8 +114,7 @@ class RelayAgent:
             logger.warning("Recovered %d message(s) left in flight by a previous run.", len(recovered))
         if not self.config.has_api_key:
             logger.warning("ORBIT_RELAY_API_KEY is not set; mail will queue locally until it is.")
-        if self.cipher is not None:
-            logger.info("Encryption is on; mail is sealed on this node with key %s.", self.cipher.kid)
+        logger.info("Inbound mail is sealed to each reader's key; this node's own key is %s.", self.cipher.kid)
 
         self._install_signal_handlers()
         self._start("orbit-relay-deliver", self._delivery_loop)
@@ -227,7 +233,8 @@ class RelayAgent:
             "queue": queue_stats,
             "last_error": last_error,
             "accepting_mail": self.config.accepting_mail,
-            "encryption_kid": self.cipher.kid if self.cipher is not None else "",
+            "encryption_kid": self.cipher.kid,
+            "encryption_public_key": self.cipher.public_key_text,
         }
 
     def heartbeat(self):
@@ -336,7 +343,7 @@ class RelayAgent:
             "server_reachable": self.server_reachable,
             "has_api_key": self.config.has_api_key,
             "accepting_mail": self.accepting_mail,
-            "encryption": {"enabled": self.cipher is not None, "kid": self.cipher.kid if self.cipher is not None else ""},
+            "encryption": {"enabled": True, "kid": self.cipher.kid, "public_key": self.cipher.public_key_text},
             "queue": self.queue.stats(),
             "queue_bytes": self.queue.total_bytes(),
             "domains": self.domains,
