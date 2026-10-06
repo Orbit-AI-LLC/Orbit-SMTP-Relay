@@ -5,6 +5,10 @@
 # under the recipient's address, then handed to `orbit-relay receive`, whose
 # exit status is the verdict Postfix acts on (0 accept, 75 defer, 67 reject).
 set -euo pipefail
+# Postfix bounces on any status it does not know as temporary, so a failure
+# on this host (a full disk, say) defers the message instead, and leaves no
+# partial copy behind.
+trap '[ -z "${tmp:-}" ] || rm -f "$tmp"; exit 75' ERR
 
 MAILDROP_DIR="${ORBIT_MAILDROP_DIR:-/var/spool/orbit-mail/incoming}"
 recipient="$(printf '%s' "${1:-}" | tr 'A-Z' 'a-z' | tr -cd 'a-z0-9@._+-')"
@@ -15,11 +19,17 @@ fi
 mkdir -p "$MAILDROP_DIR"
 tmp="$(mktemp "$MAILDROP_DIR/.incoming-XXXXXX")"
 cat > "$tmp"
-# One file per recipient; a second message for the same address while the
-# first is unprocessed gets a numeric suffix the agent strips.
-target="$MAILDROP_DIR/$recipient"
-if [ -e "$target" ]; then
-    target="$target.$$"
-fi
+# One file per delivery, named after the recipient. The numeric suffix, which
+# the agent strips, keeps two messages for one address that arrive together
+# from overwriting each other.
+target="$MAILDROP_DIR/$recipient.$$"
 mv "$tmp" "$target"
-exec /usr/local/bin/orbit-relay receive "$(basename "$target")"
+status=0
+/usr/local/bin/orbit-relay receive "$(basename "$target")" || status=$?
+case "$status" in
+    0|67|75) exit "$status" ;;
+esac
+# Anything else is the agent failing on this host (a crash, or an update half
+# done), which is no reason to bounce the sender's mail.
+rm -f "$target"
+exit 75

@@ -30,8 +30,8 @@ You need a relay API key. There are two kinds:
 - **Your own key**, from **Settings, Encryption** in Orbit Mail. A relay
   using it delivers to, and sends for, your mailboxes only. This is how you
   run a relay of your own for a hosted Orbit Mail account.
-- **The admin key**, from the **Relay** page of the admin area, for the
-  fleet that serves every mailbox on a server you administer.
+- **The fleet key**, from the **Mail** page of Mission Control's control
+  area, for the fleet that serves every mailbox.
 
 Either page prints the install command. Run it on a fresh host; it is the
 same as:
@@ -55,8 +55,9 @@ The host's Postfix becomes the relay. A `main.cf` the installer did not write
 is kept as `/etc/postfix/main.cf.before-orbit-relay`, and installing Postfix
 replaces Exim on Debian, so use a host that runs no other mail server.
 
-Then point each domain's MX record at this host (an administrator also sets
-the **relay hostname** on the Relay page so the DNS instructions show it).
+Then point each domain's MX record at this host (for the fleet, a super admin
+also sets the **relay hostname** on Mission Control's Mail page so the DNS
+instructions show it).
 
 | Option | Purpose |
 |---|---|
@@ -128,7 +129,7 @@ Things to know:
   sender lists, but not on body content.
 - **Key ids** are the first twelve hex characters of a public key's SHA-256
   and reveal nothing secret. The node reports its key id and public key on
-  every heartbeat; the admin area shows the id.
+  every heartbeat; Orbit Mail's Relays list and Mission Control show the id.
 - **Readers' keys are cached** on the node for ten minutes
   (`ORBIT_KEY_CACHE_SECONDS`), and a key seen recently is still used if the
   server is briefly unreachable.
@@ -173,7 +174,7 @@ backoff. A message the server rejects for good (no such mailbox) is parked in
 **Configuration.** Every heartbeat sends the node's status (queue depth,
 version, its key id and public key, last error) and receives the domains,
 deliverable addresses, catch-all domains and fleet settings the node's API
-key may serve: everything for the admin key, the owner's mailboxes for a
+key may serve: everything for the fleet key, the owner's mailboxes for a
 user key. The agent writes them as Postfix lookup tables only when the
 server's `config_digest` changes; Postfix notices a rebuilt table by itself,
 so the agent needs no root to update it.
@@ -219,7 +220,7 @@ messages. A growing `dead` count means something is permanently wrong; look at
 rewrites the Postfix configuration and restarts both services; the queue in
 `/var/lib/orbit-mail` is untouched.
 
-**Rotating the API key.** Rotate it in the admin area, then re-run the install
+**Rotating the API key.** Rotate it where it was issued, then re-run the install
 command with the new key on each node. Until then, the node keeps accepting and
 queueing mail; it just cannot deliver it.
 
@@ -241,7 +242,7 @@ the TLS certificate are installer options for that reason.
 
 **DKIM.** Put a signing key in `/etc/orbit-mail/dkim` and configure a DKIM
 milter in Postfix if you need signed outbound mail; paste the public key into
-the domain's page in the admin area so it appears in the DNS records.
+the domain's page in Mission Control so it appears in the DNS records.
 
 ## Configuration
 
@@ -254,8 +255,8 @@ of the installer.
 | Variable | Default | Purpose |
 |---|---|---|
 | `ORBIT_MAIL_SERVER_URL` | `http://localhost:8100` | The Orbit Mail server. |
-| `ORBIT_RELAY_API_KEY` | (none) | Your own key from Settings, Encryption, or the admin key from the admin area. Without it mail queues locally. |
-| `ORBIT_RELAY_NAME` | hostname | Node name shown in the admin area. |
+| `ORBIT_RELAY_API_KEY` | (none) | Your own key from Settings, Encryption, or the fleet key from Mission Control. Without it mail queues locally. |
+| `ORBIT_RELAY_NAME` | hostname | Node name shown under Relays in Orbit Mail and on Mission Control's Mail page. |
 | `ORBIT_RELAY_HOSTNAME` | FQDN | EHLO name; should match the MX record. |
 | `ORBIT_RELAY_ENCRYPTION_KEY_FILE` | `/etc/orbit-mail/relay.key` | The node's `orbp_...` private key. Required; the node does not start without one. |
 | `ORBIT_RELAY_ENCRYPTION_KEY` | (none) | The key itself, for environments without a file. The file is preferred. |

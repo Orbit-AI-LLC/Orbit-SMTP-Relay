@@ -35,11 +35,17 @@ logger = logging.getLogger(__name__)
 
 
 def split_headers(raw_bytes):
-    """Return ``(header_block, body)`` of an RFC 822 message as bytes."""
-    for separator in (b"\r\n\r\n", b"\n\n"):
-        index = raw_bytes.find(separator)
-        if index != -1:
-            return raw_bytes[:index], raw_bytes[index + len(separator):]
+    """Return ``(header_block, body)`` of an RFC 822 message as bytes.
+
+    The first blank line ends the headers, whichever line ending it uses:
+    Postfix pipes mail with bare LF, and a CRLF pair further down belongs to
+    the body, which must not reach the readable header block.
+    """
+    found = [(raw_bytes.find(separator), separator) for separator in (b"\r\n\r\n", b"\n\n")]
+    found = [(index, separator) for index, separator in found if index != -1]
+    if found:
+        index, separator = min(found)
+        return raw_bytes[:index], raw_bytes[index + len(separator):]
     return raw_bytes, b""
 
 
@@ -200,9 +206,10 @@ class Maildrop:
         # Postfix names the drop file after the envelope recipient, which is the
         # only value that is correct when a message has several `To:` headers
         # and was delivered to exactly one mailbox. The filename is recovered by
-        # stripping only the numeric claim suffix, because an email address contains
-        # dots of its own, so splitting on "." would truncate the domain.
-        stem = _original_name(path)
+        # stripping only the numeric suffixes (the receive hook's and the
+        # claim's), because an email address contains dots of its own, so
+        # splitting on "." would truncate the domain.
+        stem = _original_name(_original_name(path))
         if stem and "@" in stem:
             recipient = stem.lower()
 

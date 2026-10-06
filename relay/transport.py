@@ -32,6 +32,10 @@ class TransportError(Exception):
 class RetryableError(TransportError):
     """The request may succeed later. Keep the message queued."""
 
+    def __init__(self, message, status=None):
+        super().__init__(message)
+        self.status = status
+
 
 class PermanentError(TransportError):
     """The request will never succeed. Stop retrying."""
@@ -85,23 +89,27 @@ class HttpClient:
             status = error.code
             detail = ""
             retryable = None
+            code = None
             try:
                 parsed = json.loads(body)
                 detail = parsed.get("error", "")
                 retryable = parsed.get("retryable")
+                code = parsed.get("code")
             except (json.JSONDecodeError, AttributeError):
                 detail = body[:200]
             message = f"HTTP {status}: {detail or error.reason}"
             if retryable is True or status in (401, 429) or status >= 500:
-                raise RetryableError(message) from error
-            raise PermanentError(message, status=status) from error
+                raise RetryableError(message, status=status) from error
+            raise PermanentError(message, status=status, code=code) from error
         except urllib.error.URLError as error:
             raise RetryableError(f"Connection failed: {error.reason}") from error
         except (socket.timeout, TimeoutError) as error:
             raise RetryableError(f"Timed out: {error}") from error
         except ssl.SSLError as error:
-            # A TLS failure is configuration, not transient.
-            raise PermanentError(f"TLS error: {error}") from error
+            # The connection broke while the answer was being read. A
+            # certificate problem fails the handshake instead, and urllib
+            # reports that as the URLError above.
+            raise RetryableError(f"TLS error: {error}") from error
         except OSError as error:
             raise RetryableError(f"Network error: {error}") from error
 
@@ -160,9 +168,16 @@ class MailServerClient:
         payload["config_digest"] = config_digest
         return self.http.request(self._url(self.config.heartbeat_path), payload=payload, headers=self._headers()).json()
 
-    def claim_outbound(self, limit=10):
-        """Take a batch of outgoing messages to send."""
+    def claim_outbound(self, limit=10, encryption_kid=""):
+        """Take a batch of outgoing messages to send.
+
+        Sealed mail goes only to a node it was sealed to. Naming this node's
+        key id keeps that right when another node (another owner's, say)
+        reports under the same name.
+        """
         payload = {"node": self.config.node_name, "limit": limit}
+        if encryption_kid:
+            payload["encryption_kid"] = encryption_kid
         return self.http.request(self._url(self.config.outbound_claim_path), payload=payload, headers=self._headers()).json()
 
     def report_outbound(self, outbound_id, status, error=""):
@@ -178,15 +193,18 @@ class MailServerClient:
 
         Returns None when the mailbox exists but nobody who reads it has set
         a key yet. Raises PermanentError when this node's API key may not deliver
-        to that mailbox, RetryableError when the server cannot be reached.
+        to that mailbox or there is no such mailbox, RetryableError when the
+        server cannot be reached.
         """
         from urllib.parse import urlencode
 
         url = self._url(self.config.keys_path) + "?" + urlencode({"address": address})
         try:
             response = self.http.request(url, method="GET", headers=self._headers())
-        except PermanentError as error:
-            if error.status == 404:
+        except (RetryableError, PermanentError) as error:
+            # The server answers 404 with code no_key, marked retryable, until
+            # a reader sets a key, and 404 with code no_mailbox for good.
+            if error.status == 404 and getattr(error, "code", None) != "no_mailbox":
                 return None
             raise
         body = response.json()

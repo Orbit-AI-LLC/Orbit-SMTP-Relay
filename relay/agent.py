@@ -172,7 +172,13 @@ class RelayAgent:
                     self.deliver_one(message)
                 except Exception:
                     logger.exception("Unexpected error delivering %s", message.id)
-                    self.queue.requeue(message, "internal error")
+                    try:
+                        self.queue.requeue(message, "internal error")
+                    except Exception:
+                        # A full disk, say. Raising here would end this thread
+                        # while the agent kept running; the message is retried
+                        # from where it is, at the latest after a restart.
+                        logger.exception("Could not requeue %s", message.id)
                     with self._lock:
                         self.stats["failed"] += 1
 
@@ -262,7 +268,10 @@ class RelayAgent:
         try:
             self.tables.apply(payload)
         except Exception:
+            # The old digest stays, so the next heartbeat is sent the full
+            # lists again instead of being told nothing changed.
             logger.exception("Could not update the Postfix tables.")
+            return
         self.config_digest = payload.get("config_digest", self.config_digest)
 
     # --- Outbound ---------------------------------------------------------
@@ -286,16 +295,23 @@ class RelayAgent:
                 return
 
     def send_batch(self):
-        """Claim and send one batch. Returns the number of messages handled."""
+        """Claim and send one batch. Returns the number of messages handled.
+
+        A deferred message goes straight back on the server's queue, so it
+        does not count: a batch that was all deferred makes the loop wait
+        before claiming again rather than claim the same messages at once.
+        """
         if not self.config.has_api_key:
             return 0
-        payload = self.server.claim_outbound(limit=self.config.outbound_batch)
+        payload = self.server.claim_outbound(limit=self.config.outbound_batch, encryption_kid=self.cipher.kid)
         items = payload.get("messages") or []
+        handled = 0
         for item in items:
             if self._stop.is_set():
                 break
-            self.send_one(item)
-        return len(items)
+            if self.send_one(item) != "deferred":
+                handled += 1
+        return handled
 
     def send_one(self, item):
         outbound_id = item.get("id")
@@ -305,6 +321,12 @@ class RelayAgent:
             # Another node may hold the right key; the claim lapses and the
             # server offers the message again.
             status, error = "deferred", str(problem)
+            raw = None
+        except Exception as problem:
+            # A message that cannot be assembled (a header with a line break
+            # in it, say) never will be. Raising would leave the rest of the
+            # batch claimed and unsent, to be claimed again beside this one.
+            status, error = "failed", f"Could not assemble the message: {problem}"
             raw = None
         if raw is not None:
             status, error = self.sender.send(item.get("envelope_from", ""), item.get("recipients") or [], raw)

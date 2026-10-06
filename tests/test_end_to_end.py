@@ -11,20 +11,28 @@ contract under test is the relay's *behaviour* on a failure, not urllib's.
 """
 
 import base64
+import io
 import json
 import os
+import ssl
 import stat
+import subprocess
+import sys
 import tempfile
+import threading
 import time
 import unittest
+import urllib.error
+from unittest import mock
 
 from relay.config import Config
 from relay.crypto import Cipher, generate_key
+from relay.keys import PublicKeyDirectory
 from relay.outbound import Sender, decode_raw
 from relay.postfix import Maildrop
 from relay.postfix_config import PostfixTables
-from relay.queue import Queue
-from relay.transport import MailServerClient, PermanentError, Response, RetryableError
+from relay.queue import Queue, QueuedMessage
+from relay.transport import HttpClient, MailServerClient, PermanentError, Response, RetryableError
 
 RAW = (
     "From: Bob <bob@example.org>\r\n"
@@ -193,6 +201,88 @@ class EndToEndTests(unittest.TestCase):
         recipients = {r["payload"]["recipient"] for r in self.server.requests}
         self.assertEqual(recipients, {f"user{i}@example.com" for i in range(5)})
 
+    def test_a_failed_requeue_does_not_end_the_delivery_loop(self):
+        from relay.agent import RelayAgent
+
+        root = self._tmp.name
+        config = make_config(queue_dir=os.path.join(root, "agent-q"), maildrop_dir=os.path.join(root, "agent-m"),
+                             state_dir=os.path.join(root, "agent-s"), log_backend="memory")
+        agent = RelayAgent(config=config, keys=AnyReader())
+        agent.queue.enqueue(QueuedMessage(recipient="alice@example.com", raw="x", encryption={"kid": "k"}))
+        agent.server.deliver = mock.Mock(side_effect=RuntimeError("unexpected"))
+        agent.queue.requeue = mock.Mock(side_effect=OSError(28, "No space left on device"))
+        threading.Timer(0.3, agent.stop).start()
+        # Returns once stopped; before, the requeue error ended the thread.
+        agent._delivery_loop()
+        self.assertEqual(agent.stats["failed"], 1)
+
+
+class ReceiveHookTests(unittest.TestCase):
+    """deploy/orbit-relay-receive and `orbit-relay receive` together, as
+    Postfix runs them, with the reader's key in the node's cache."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        root = self._tmp.name
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        command = os.path.join(root, "orbit-relay")
+        with open(command, "w") as handle:
+            handle.write(f'#!/bin/sh\nPYTHONPATH="{repo}" exec "{sys.executable}" -m relay.cli "$@"\n')
+        os.chmod(command, 0o755)
+        with open(os.path.join(repo, "deploy", "orbit-relay-receive")) as handle:
+            hook = handle.read().replace("/usr/local/bin/orbit-relay", command)
+        self.hook = os.path.join(root, "orbit-relay-receive")
+        with open(self.hook, "w") as handle:
+            handle.write(hook)
+        os.chmod(self.hook, 0o755)
+        self.maildrop_dir = os.path.join(root, "incoming")
+        self.queue = Queue(os.path.join(root, "queue"))
+        self.keys = PublicKeyDirectory(None, os.path.join(root, "state", "keys"))
+        self.reader = Cipher.from_text(generate_key())
+        # Nothing listens on port 9: the keys come from the cache or not at all.
+        self.env = dict(os.environ, ORBIT_CONFIG_FILE="", ORBIT_MAIL_SERVER_URL="http://127.0.0.1:9",
+                        ORBIT_RELAY_API_KEY="orbk_test", ORBIT_RELAY_ENCRYPTION_KEY=generate_key(),
+                        ORBIT_QUEUE_DIR=self.queue.root, ORBIT_MAILDROP_DIR=self.maildrop_dir,
+                        ORBIT_STATE_DIR=os.path.join(root, "state"), ORBIT_LOG_LEVEL="ERROR")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def set_key(self, present=True):
+        record = {"address": "alice@example.com", "fetched_at": time.time()}
+        if present:
+            record["readers"] = [{"kid": self.reader.kid, "public_key": self.reader.public_key_text}]
+        self.keys._write("alice@example.com", record)
+
+    def start(self, subject="Lunch"):
+        process = subprocess.Popen([self.hook, "alice@example.com"], stdin=subprocess.PIPE, env=self.env,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        process.stdin.write(RAW.replace("Lunch", subject).replace("\r\n", "\n").encode())
+        process.stdin.close()
+        return process
+
+    def queued(self):
+        names = os.listdir(self.queue.pending_dir) if os.path.isdir(self.queue.pending_dir) else []
+        return [self.queue.peek(name[:-len(".json")]) for name in names]
+
+    def test_a_deferred_message_is_accepted_on_the_retry(self):
+        self.set_key(present=False)
+        self.assertEqual(self.start().wait(), 75)
+        # Postfix keeps the message and pipes it again; no copy stays here.
+        self.assertEqual([name for _, _, names in os.walk(self.maildrop_dir) for name in names], [])
+        self.set_key()
+        self.assertEqual(self.start().wait(), 0)
+        self.assertEqual([m.recipient for m in self.queued()], ["alice@example.com"])
+
+    def test_messages_for_one_address_arriving_together_all_land(self):
+        self.set_key()
+        processes = [self.start(subject=f"Lunch {i}") for i in range(8)]
+        self.assertEqual([p.wait() for p in processes], [0] * 8)
+        queued = self.queued()
+        self.assertEqual({m.recipient for m in queued}, {"alice@example.com"})
+        subjects = {self.reader.open(m.encryption, m.raw).split(b"Subject: ")[1].split(b"\n")[0] for m in queued}
+        self.assertEqual(subjects, {f"Lunch {i}".encode() for i in range(8)})
+
 
 class FakeSendmail:
     """Writes a tiny sendmail script that records what it was given."""
@@ -263,9 +353,30 @@ class OutboundTests(unittest.TestCase):
         self.assertIn("Subject: Out", fake.read())
         claim, report = server.requests
         self.assertTrue(claim["url"].endswith("/api/relay/outbound/claim/"))
+        # The server hands sealed mail only to a node it was sealed to; the
+        # key id says which, whatever other node shares this one's name.
+        self.assertEqual(claim["payload"]["encryption_kid"], agent.cipher.kid)
         self.assertTrue(report["url"].endswith("/api/relay/outbound/ob-1/result/"))
         self.assertEqual(report["payload"]["status"], "sent")
         self.assertEqual(agent.stats["sent"], 1)
+
+    def test_an_all_deferred_batch_counts_as_nothing_handled(self):
+        # Deferred mail is back on the server's queue at once; claiming again
+        # without waiting would spin on it.
+        from relay.agent import RelayAgent
+
+        config = make_config(queue_dir=os.path.join(self._tmp.name, "q"), maildrop_dir=os.path.join(self._tmp.name, "m"),
+                             state_dir=os.path.join(self._tmp.name, "s"), sendmail_path=os.path.join(self._tmp.name, "missing"),
+                             log_backend="memory")
+        server = ScriptedServer()
+        raw = base64.b64encode(b"Subject: Out\r\n\r\nBye\r\n").decode()
+        items = [{"id": f"ob-{i}", "envelope_from": "ada@example.com", "recipients": ["bob@example.org"], "raw_base64": raw}
+                 for i in range(2)]
+        server.queue_reply((200, json.dumps({"messages": items})), (200, "{}"), (200, "{}"))
+        agent = RelayAgent(config=config)
+        agent.server.http.request = server
+        self.assertEqual(agent.send_batch(), 0)
+        self.assertEqual([r["payload"]["status"] for r in server.requests[1:]], ["deferred", "deferred"])
 
     def test_decode_raw_prefers_base64(self):
         self.assertEqual(decode_raw({"raw_base64": base64.b64encode(b"hi").decode()}), b"hi")
@@ -316,6 +427,24 @@ class HeartbeatTests(unittest.TestCase):
         self.assertEqual(server.requests[1]["payload"]["config_digest"], "abc")
         self.assertEqual(os.stat(os.path.join(postfix_dir, "relay_domains")).st_mtime_ns, before)
 
+    def test_a_failed_table_write_keeps_the_old_digest(self):
+        from relay.agent import RelayAgent
+
+        tables = mock.Mock()
+        tables.apply.side_effect = OSError(28, "No space left on device")
+        config = make_config(queue_dir=os.path.join(self._tmp.name, "q"), maildrop_dir=os.path.join(self._tmp.name, "m"),
+                             state_dir=os.path.join(self._tmp.name, "s"), log_backend="memory")
+        server = ScriptedServer()
+        full = {"domains": ["example.com"], "recipients": ["ada@example.com"], "config_digest": "abc"}
+        server.queue_reply((200, json.dumps(full)), (200, json.dumps(full)))
+        agent = RelayAgent(config=config, tables=tables)
+        agent.server.http.request = server
+        agent.heartbeat()
+        self.assertEqual(agent.config_digest, "")
+        # So the next heartbeat asks for the full lists again.
+        agent.heartbeat()
+        self.assertEqual(server.requests[1]["payload"]["config_digest"], "")
+
     def test_tables_disabled_without_directory(self):
         tables = PostfixTables("")
         self.assertFalse(tables.apply({"domains": ["x.com"], "recipients": [], "config_digest": "z"}))
@@ -332,6 +461,66 @@ class HeartbeatTests(unittest.TestCase):
             self.assertTrue(tables.apply({"domains": ["x.com"], "recipients": ["a@x.com"], "config_digest": "z"}))
             with open(calls) as handle:
                 self.assertEqual([line.split(":")[0] for line in handle.read().splitlines()], ["lmdb", "lmdb"])
+
+
+class HttpClientTests(unittest.TestCase):
+    """How answers from the server, and failures reaching it, are classified."""
+
+    def answer(self, status, body):
+        error = urllib.error.HTTPError("https://mail.example.com/x", status, "error", {}, io.BytesIO(json.dumps(body).encode()))
+        with mock.patch("urllib.request.urlopen", side_effect=error):
+            HttpClient().request("https://mail.example.com/x", method="GET")
+
+    def test_no_key_yet_is_a_retryable_404(self):
+        with self.assertRaises(RetryableError) as caught:
+            self.answer(404, {"error": "no key yet", "retryable": True, "code": "no_key"})
+        self.assertEqual(caught.exception.status, 404)
+
+    def test_no_such_mailbox_carries_its_code(self):
+        with self.assertRaises(PermanentError) as caught:
+            self.answer(404, {"error": "not a deliverable mailbox", "retryable": False, "code": "no_mailbox"})
+        self.assertEqual((caught.exception.status, caught.exception.code), (404, "no_mailbox"))
+
+    def test_a_connection_cut_off_mid_answer_is_retryable(self):
+        with mock.patch("urllib.request.urlopen", side_effect=ssl.SSLEOFError(8, "EOF occurred in violation of protocol")):
+            with self.assertRaises(RetryableError):
+                HttpClient().request("https://mail.example.com/api/relay/inbound/", payload={})
+
+
+class CommandTests(unittest.TestCase):
+    def test_ping_reports_the_node_key(self):
+        # The server stores whatever key a heartbeat names, blank included.
+        import contextlib
+
+        from relay import cli
+
+        key = generate_key()
+        seen = {}
+
+        class Client:
+            def __init__(self, config):
+                pass
+
+            def health(self):
+                return Response(200, "{}", {})
+
+            def heartbeat(self, status, config_digest=""):
+                seen.update(status)
+                return {}
+
+        names = ("ORBIT_CONFIG_FILE", "ORBIT_RELAY_ENCRYPTION_KEY")
+        saved = {name: os.environ.pop(name, None) for name in names}
+        os.environ.update(ORBIT_CONFIG_FILE="", ORBIT_RELAY_ENCRYPTION_KEY=key)
+        try:
+            with mock.patch("relay.transport.MailServerClient", Client), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(cli.cmd_ping(None), 0)
+        finally:
+            for name in names:
+                os.environ.pop(name, None)
+                if saved[name] is not None:
+                    os.environ[name] = saved[name]
+        node = Cipher.from_text(key)
+        self.assertEqual((seen["encryption_kid"], seen["encryption_public_key"]), (node.kid, node.public_key_text))
 
 
 class ConfigTests(unittest.TestCase):

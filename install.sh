@@ -6,9 +6,10 @@
 #   curl -fsSL https://raw.githubusercontent.com/Oribt-AI/Orbit-SMTP-Relay/main/install.sh \
 #       | sudo bash -s -- --server https://mail.example.com --key orbk_...
 #
-# The same command is printed, with the server filled in, by the Orbit Mail
-# admin area under Relay. Re-running it on the same host updates the node in
-# place: its settings and the encryption key are remembered.
+# The same command is printed, with the server filled in, by Orbit Mail under
+# Settings, Encryption, and by Mission Control's Mail page for the fleet.
+# Re-running it on the same host updates the node in place: its settings and
+# the encryption key are remembered.
 #
 # What it does: installs Postfix and Python from the distribution, clones this
 # repository to /opt/orbit-relay, generates the node's encryption key once,
@@ -58,8 +59,9 @@ usage() {
 Install or update an Orbit SMTP Relay node.
 
   --server <url>       Orbit Mail server URL (required on first install)
-  --key <api-key>      Relay API key from the Orbit Mail admin area (required on first install)
-  --name <name>        Node name shown in the admin area (default: short hostname)
+  --key <api-key>      Relay API key from Orbit Mail (Settings, Encryption) or Mission Control's
+                       fleet key (required on first install)
+  --name <name>        Node name shown under Relays (default: short hostname)
   --hostname <fqdn>    Hostname Postfix announces in EHLO (default: this host's FQDN)
   --tls-cert <path>    Certificate Postfix presents for STARTTLS (default: a self-signed one)
   --tls-key <path>     Its private key
@@ -142,7 +144,7 @@ resolve_settings() {
     SERVER_URL="${SERVER_URL%/}"
 
     [[ -n "$API_KEY" ]] || API_KEY="$(read_env_value ORBIT_RELAY_API_KEY)"
-    [[ -n "$API_KEY" ]] || die "--key is required on first install. Issue one in the Orbit Mail admin area under Relay."
+    [[ -n "$API_KEY" ]] || die "--key is required on first install. Issue one in Orbit Mail under Settings, Encryption (or the fleet key in Mission Control)."
     if [[ "$SERVER_URL" =~ ^http:// ]]; then
         warn "The server URL is plain http. The API key will travel unencrypted; use https in production."
     fi
@@ -479,8 +481,8 @@ $(log "Relay node ${NODE_NAME} is installed.")
                   the server. This node's own key is ${KEY_FILE}; back it up,
                   and show its id with: orbit-relay key show
 
-Next: in the Orbit Mail admin area, set the relay hostname to ${RELAY_HOSTNAME}
-and point each domain's MX record at it.
+Next: point each domain's MX record at ${RELAY_HOSTNAME}. For Orbit's own
+fleet, also set it as the relay hostname on Mission Control's Mail page.
 SUMMARY
 
 if (( ${#MIGRATED_VOLUMES[@]} )); then

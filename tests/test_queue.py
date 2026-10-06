@@ -103,6 +103,21 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(queue.stats()["dead"], 1)
         self.assertIn("retries exhausted", queue.list_dead()[0].last_error)
 
+    def test_parking_keeps_the_last_error_readable(self):
+        message = self.queue.enqueue(self.message())
+        self.queue.mark_inflight(message)
+        self.queue.requeue(message, "HTTP 503: Service Unavailable")
+        parked = self.queue.move_to_dead(message, "retries exhausted")
+        self.assertEqual(parked.last_error, "HTTP 503: Service Unavailable | parked: retries exhausted")
+
+    def test_a_failed_write_leaves_no_partial_file(self):
+        from unittest import mock
+
+        with mock.patch("relay.queue.os.fsync", side_effect=OSError(28, "No space left on device")):
+            with self.assertRaises(OSError):
+                self.queue.enqueue(self.message())
+        self.assertEqual(os.listdir(self.queue.pending_dir), [])
+
     def test_max_age_parks_the_message(self):
         queue = make_queue(self.root, max_age_hours=1)
         message = queue.enqueue(self.message())

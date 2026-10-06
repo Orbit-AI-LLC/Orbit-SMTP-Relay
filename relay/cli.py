@@ -119,7 +119,9 @@ def cmd_receive(args):
         # There is no readable mode. Without the reader's key the message
         # waits in Postfix's queue (deferred) until the reader sets one, or
         # bounces (rejected) when this node may never deliver to that mailbox.
-        maildrop.release(path)
+        # Either way Postfix keeps its own copy and pipes it again on a retry,
+        # so the drop file is removed rather than left readable on disk.
+        maildrop.discard(path)
         if error.retryable:
             logger.warning("Deferring %s: %s", args.filename, error)
             return 75  # EX_TEMPFAIL
@@ -127,7 +129,7 @@ def cmd_receive(args):
         return 67
     except Exception:
         logger.exception("Failed to accept %s", args.filename)
-        maildrop.release(path)
+        maildrop.discard(path)
         return 75  # EX_TEMPFAIL
 
     maildrop.discard(path)
@@ -176,9 +178,13 @@ def cmd_ping(args):
     config = load_config()
     setup_logging(level="WARNING", backend="memory")
     client = MailServerClient(config)
+    # The server records the key a heartbeat names; one without it would stop
+    # browsers sealing to this node until the agent's next heartbeat.
+    encryption = _encryption_summary(config)
     try:
         health = client.health().json()
-        payload = client.heartbeat({"node": config.node_name, "hostname": config.hostname, "version": "ping"})
+        payload = client.heartbeat({"node": config.node_name, "hostname": config.hostname, "version": "ping",
+                                    "encryption_kid": encryption["kid"], "encryption_public_key": encryption["public_key"]})
     except TransportError as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 1

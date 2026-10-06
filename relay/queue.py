@@ -178,11 +178,20 @@ class Queue:
         path = self._path(directory, message.id)
         tmp = f"{path}.tmp"
         payload = json.dumps(message.to_dict(), ensure_ascii=False)
-        with open(tmp, "w", encoding="utf-8") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp, path)
+        try:
+            with open(tmp, "w", encoding="utf-8") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, path)
+        except Exception:
+            # Nothing reads a half-written file again, so on a full disk it
+            # would only hold on to space that is already short.
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
         # Fsync the directory so the rename itself survives a power loss, not
         # just the file contents.
         try:
@@ -326,7 +335,7 @@ class Queue:
 
     def move_to_dead(self, message, reason=""):
         """Park a message that will never succeed, keeping it for inspection."""
-        message.last_error = (message.last_error or "") + f" | parked: {reason}".strip(" |")
+        message.last_error = ((message.last_error or "") + f" | parked: {reason}").strip(" |")
         self._write(self.dead_dir, message)
         self._remove(self._path(self.pending_dir, message.id))
         self._remove(self._path(self.inflight_dir, message.id))

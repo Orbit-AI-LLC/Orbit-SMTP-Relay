@@ -245,6 +245,27 @@ class KeyDirectoryTests(unittest.TestCase):
             self.directory.lookup("alice@example.com")
         self.assertEqual(len(self.requests), 1)
 
+    def test_no_key_answer_is_remembered_and_never_served_from_a_stale_cache(self):
+        # The server sends no_key as a retryable 404. A reader list cached
+        # earlier is no longer the right one, so it is not used.
+        self.directory._write("alice@example.com", {
+            "address": "alice@example.com", "readers": [{"kid": self.reader.kid, "public_key": self.reader.public_key_text}],
+            "fetched_at": time.time() - 3600,
+        })
+        self.replies.append(RetryableError("HTTP 404: alice@example.com has no encryption key yet.", status=404))
+        with self.assertRaises(KeyUnavailable) as caught:
+            self.directory.readers("alice@example.com")
+        self.assertTrue(caught.exception.retryable)
+        with self.assertRaises(KeyUnavailable):
+            self.directory.readers("alice@example.com")
+        self.assertEqual(len(self.requests), 1)
+
+    def test_no_such_mailbox_is_not_retryable(self):
+        self.replies.append(PermanentError("HTTP 404: not a deliverable mailbox", status=404, code="no_mailbox"))
+        with self.assertRaises(KeyUnavailable) as caught:
+            self.directory.readers("gone@example.com")
+        self.assertFalse(caught.exception.retryable)
+
     def test_forbidden_mailbox_is_not_retryable(self):
         self.replies.append(PermanentError("HTTP 403: not yours", status=403))
         with self.assertRaises(KeyUnavailable) as caught:
@@ -342,6 +363,8 @@ class InboundEncryptionTests(unittest.TestCase):
         self.assertEqual((head, body), (b"A: 1\r\nB: 2", b"body\r\n"))
         self.assertEqual(split_headers(b"A: 1\n\nbody"), (b"A: 1", b"body"))
         self.assertEqual(split_headers(b"A: 1"), (b"A: 1", b""))
+        # Postfix pipes bare LF; a CRLF blank line later on is body.
+        self.assertEqual(split_headers(b"A: 1\n\nsecret\r\n\r\nmore"), (b"A: 1", b"secret\r\n\r\nmore"))
 
     def test_plaintext_never_touches_the_queue(self):
         message = self.accept()
@@ -365,6 +388,11 @@ class InboundEncryptionTests(unittest.TestCase):
         self.assertEqual(len(message.encryption["keys"]), 3)
         for text in members:
             self.assertEqual(Cipher.from_text(text).open(message.encryption, message.raw), RAW.replace("alice@example.com", "support@example.com").encode())
+
+    def test_a_suffixed_drop_file_is_for_the_address(self):
+        # The receive hook adds a numeric suffix to every drop file.
+        message = self.accept(name="alice@example.com.4242")
+        self.assertEqual(message.recipient, "alice@example.com")
 
     def test_reader_without_a_key_is_not_queued(self):
         with self.assertRaises(KeyUnavailable):
@@ -468,6 +496,30 @@ class OutboundEncryptionTests(unittest.TestCase):
         only_author = self.compose_item(readers=[(self.author.kid, self.author.public_key)])
         with self.assertRaises(EncryptionError):
             decode_item(only_author, self.node)
+
+    def test_a_message_that_cannot_be_built_fails_without_holding_up_the_batch(self):
+        from tests.test_end_to_end import FakeSendmail, ScriptedServer
+        from relay.agent import RelayAgent
+
+        with tempfile.TemporaryDirectory() as root:
+            fake = FakeSendmail(root)
+            config = make_config(queue_dir=os.path.join(root, "q"), maildrop_dir=os.path.join(root, "m"),
+                                 state_dir=os.path.join(root, "s"), sendmail_path=fake.path, log_backend="memory")
+            broken = self.compose_item(id="ob-1")
+            broken["headers"]["Subject"] = "Hi\nBcc: someone@example.net"
+            good = self.compose_item(id="ob-2")
+            server = ScriptedServer()
+            server.queue_reply(
+                (200, json.dumps({"messages": [broken, good], "remaining": 0})),
+                (200, json.dumps({"id": "ob-1", "status": "failed"})),
+                (200, json.dumps({"id": "ob-2", "status": "sent"})),
+            )
+            agent = RelayAgent(config=config, cipher=self.node)
+            agent.server.http.request = server
+            self.assertEqual(agent.send_batch(), 2)
+            reports = {r["url"].split("/")[-3]: r["payload"]["status"] for r in server.requests[1:]}
+            self.assertEqual(reports, {"ob-1": "failed", "ob-2": "sent"})
+            self.assertIn("Hello from the browser", fake.read())
 
     def test_agent_defers_when_not_sealed_to_it_and_sends_when_it_is(self):
         from tests.test_end_to_end import FakeSendmail, ScriptedServer
