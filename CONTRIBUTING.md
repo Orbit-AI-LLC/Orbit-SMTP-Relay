@@ -21,7 +21,7 @@ easy to work on:
 - **Keep the README current.** It is the source of truth for setup,
   behaviour and configuration; a change in behaviour is a change there too.
 - **Shell scripts pass `bash -n` and ShellCheck** at warning level. CI runs
-  both, plus a Docker build.
+  both, plus a real install on a fresh Ubuntu host (`tests/host_smoke.py`).
 - **Write plainly.** Comments explain why, not what. Keep sentences short and
   avoid em-dashes in prose.
 

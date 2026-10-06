@@ -1,8 +1,9 @@
 """Relay configuration, read from the environment.
 
-Everything is an environment variable so the same image runs unchanged on every
+Everything is an environment variable so the same code runs unchanged on every
 node; a node differs only by its name and the API key. The install script
-served by Orbit Mail writes these into ``/etc/orbit-mail/relay.env``.
+served by Orbit Mail writes these into ``/etc/orbit-mail/relay.env``, which
+every entry point reads (see :func:`load_env_file`).
 
 There are exactly three things a node must know: where the Orbit Mail server
 is, the relay API key issued there, and its own encryption key, which opens
@@ -46,6 +47,36 @@ def _env_bool(name, default=False):
 
 #: Where the installer writes the node's encryption key.
 DEFAULT_KEY_FILE = "/etc/orbit-mail/relay.key"
+
+#: Where the installer writes the node's settings.
+DEFAULT_CONFIG_FILE = "/etc/orbit-mail/relay.env"
+
+
+def load_env_file(path):
+    """Copy ``NAME=value`` lines from ``path`` into the environment.
+
+    Postfix starts the receive hook with an almost empty environment, and an
+    operator's shell has none of the node's settings, so every entry point
+    reads the installer's file itself rather than relying on whoever started
+    it. A variable already set wins, so one command can still override a
+    value. A missing or unreadable file is not an error: validation reports
+    whatever is then missing.
+    """
+    try:
+        with open(path, encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+    except OSError:
+        return
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        name, _, value = line.partition("=")
+        name, value = name.strip(), value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        if name and not os.environ.get(name):
+            os.environ[name] = value
 
 
 @dataclass
@@ -94,10 +125,20 @@ class Config:
     maildrop_dir: str = field(default_factory=lambda: _env("ORBIT_MAILDROP_DIR", "/var/spool/orbit-mail/incoming"))
     queue_dir: str = field(default_factory=lambda: _env("ORBIT_QUEUE_DIR", "/var/lib/orbit-mail/queue"))
     state_dir: str = field(default_factory=lambda: _env("ORBIT_STATE_DIR", "/var/lib/orbit-mail/state"))
-    #: Where the Postfix lookup tables are written. Blank disables Postfix
-    #: integration (tests, or running the agent beside a hand-managed Postfix).
+    #: Where the Postfix lookup tables are written. ``Config(postfix_dir="")``
+    #: disables Postfix integration, for tests; a blank variable means the
+    #: default, like every other setting here.
     postfix_dir: str = field(default_factory=lambda: _env("ORBIT_POSTFIX_DIR", "/etc/postfix/orbit"))
+    #: The lookup table type in ``main.cf``. The installer sets it to the
+    #: host Postfix's ``default_database_type``.
+    postfix_db_type: str = field(default_factory=lambda: _env("ORBIT_POSTFIX_DB_TYPE", "hash"))
     sendmail_path: str = field(default_factory=lambda: _env("ORBIT_SENDMAIL", "/usr/sbin/sendmail"))
+
+    # --- Status endpoint --------------------------------------------------
+    #: Unauthenticated, so it listens on loopback unless told otherwise.
+    status_address: str = field(default_factory=lambda: _env("ORBIT_STATUS_ADDRESS", "127.0.0.1"))
+    #: 0 turns the endpoint off.
+    status_port: int = field(default_factory=lambda: _env_int("ORBIT_STATUS_PORT", 8080))
 
     # --- Retry policy -----------------------------------------------------
     max_retry_hours: int = field(default_factory=lambda: _env_int("ORBIT_MAX_RETRY_HOURS", 72))
@@ -149,4 +190,5 @@ class Config:
 
 
 def load_config():
+    load_env_file(os.environ.get("ORBIT_CONFIG_FILE", DEFAULT_CONFIG_FILE))
     return Config()

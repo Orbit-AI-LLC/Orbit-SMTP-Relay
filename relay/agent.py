@@ -72,7 +72,7 @@ class RelayAgent:
         )
         self.maildrop = Maildrop(self.config.maildrop_dir, self.queue, self.config.node_name, keys=self.keys)
         self.sender = sender or Sender(self.config.sendmail_path)
-        self.tables = tables or PostfixTables(self.config.postfix_dir)
+        self.tables = tables or PostfixTables(self.config.postfix_dir, db_type=self.config.postfix_db_type)
 
         self._stop = threading.Event()
         self._threads = []

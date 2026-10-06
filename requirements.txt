@@ -1,9 +1,9 @@
 # The relay agent has one third-party dependency: cryptography, for the
-# AES-256-GCM sealing of every message. Inside the image it comes from the
-# distribution's python3-cryptography package, so a node's image can be
-# rebuilt years from now without reaching PyPI and still start.
+# AES-256-GCM sealing of every message. On a node it comes from the
+# distribution's python3-cryptography package (38 on Debian 12), so a node can
+# be reinstalled years from now without reaching PyPI and still start.
 #
 # Postfix handles TLS, SPF, DKIM and rate limiting; beyond that the agent
 # needs only the standard library to move a file from a directory to an HTTP
 # endpoint and retry it until it lands.
-cryptography>=41
+cryptography>=38

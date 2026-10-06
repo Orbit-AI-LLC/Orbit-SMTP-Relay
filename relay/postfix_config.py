@@ -8,10 +8,12 @@ time the fleet configuration changes:
 ``relay_recipients``  one line per deliverable address, plus ``@domain`` for
                       catch-all domains
 
-Both are referenced from ``main.cf`` as ``hash:`` maps, so after writing them
-the agent runs ``postmap`` and asks Postfix to reload. Mail for anything not in
-the tables is rejected at the door with a 550, which is what stops a relay from
-becoming a backscatter source.
+Both are referenced from ``main.cf`` as indexed maps (``hash:`` unless the
+host's Postfix defaults to another type), so after writing them the agent runs
+``postmap``. Postfix notices a rebuilt indexed table by itself; the reload the
+agent asks for when it runs as root only makes that immediate. Mail for
+anything not in the tables is rejected at the door with a 550, which is what
+stops a relay from becoming a backscatter source.
 """
 
 from __future__ import annotations
@@ -26,8 +28,9 @@ logger = logging.getLogger("orbit.relay.postfix")
 
 
 class PostfixTables:
-    def __init__(self, directory, postmap_path="postmap", postfix_path="postfix"):
+    def __init__(self, directory, postmap_path="postmap", postfix_path="postfix", db_type="hash"):
         self.directory = directory
+        self.db_type = db_type or "hash"
         self.postmap_path = postmap_path
         self.postfix_path = postfix_path
         self.last_digest = ""
@@ -105,12 +108,14 @@ class PostfixTables:
         if not shutil.which(self.postmap_path):
             return
         try:
-            subprocess.run([self.postmap_path, f"hash:{path}"], check=False, capture_output=True, timeout=30)
+            subprocess.run([self.postmap_path, f"{self.db_type}:{path}"], check=False, capture_output=True, timeout=30)
         except (OSError, subprocess.SubprocessError) as error:
             logger.warning("postmap failed for %s: %s", path, error)
 
     def _reload(self):
-        if not shutil.which(self.postfix_path):
+        # The service runs as orbitmail, which Postfix will not take a reload
+        # from; the rebuilt tables are picked up without one.
+        if os.geteuid() != 0 or not shutil.which(self.postfix_path):
             return
         try:
             subprocess.run([self.postfix_path, "reload"], check=False, capture_output=True, timeout=30)

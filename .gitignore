@@ -6,5 +6,6 @@ build/
 dist/
 queue/
 maildrop/
-docker-compose.yml
+.claude/worktrees/
 .DS_Store
+dev/

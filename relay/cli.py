@@ -1,8 +1,8 @@
 """Command-line entry points for the relay.
 
-The container runs ``orbit-relay run``, but the same image also exposes the
-piece Postfix needs (``orbit-relay receive``) and operator commands, so nothing
-requires a shell inside the container to diagnose a problem.
+The ``orbit-relay`` service runs ``orbit-relay run``. The same command is the
+piece Postfix needs (``orbit-relay receive``) and the operator's tool, so one
+program on the host covers running, feeding and diagnosing the node.
 """
 
 from __future__ import annotations
@@ -27,8 +27,8 @@ def _build_parser():
     parser = argparse.ArgumentParser(prog="orbit-relay", description="Orbit Mail relay agent.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    run = subparsers.add_parser("run", help="Run the relay (the container's default).")
-    run.add_argument("--status-port", type=int, default=int(os.environ.get("ORBIT_STATUS_PORT", "8080")))
+    run = subparsers.add_parser("run", help="Run the relay (what the orbit-relay service runs).")
+    run.add_argument("--status-port", type=int, default=None, help="Status endpoint port; 0 turns it off (default: ORBIT_STATUS_PORT, 8080).")
 
     receive = subparsers.add_parser("receive", help="Accept one message from Postfix. Invoked by Postfix, not by humans.")
     receive.add_argument("filename", help="The dropped file's name, relative to the maildrop directory.")
@@ -70,8 +70,9 @@ def main(argv=None):
 
 def cmd_run(args):
     agent = RelayAgent()
-    if args.status_port:
-        _start_status_server(agent, args.status_port)
+    port = agent.config.status_port if args.status_port is None else args.status_port
+    if port:
+        _start_status_server(agent, agent.config.status_address, port)
     return agent.run()
 
 
@@ -236,11 +237,12 @@ def cmd_key(args):
     return 0
 
 
-def _start_status_server(agent, port):
+def _start_status_server(agent, address, port):
     """Expose queue depth and recent errors over HTTP, for monitoring.
 
     Read-only and unauthenticated by design: it reports how much mail is
-    waiting, never any of it. The install script binds it to localhost.
+    waiting, never any of it. It listens on loopback unless
+    ORBIT_STATUS_ADDRESS says otherwise.
     """
 
     class Handler(BaseHTTPRequestHandler):
@@ -265,7 +267,7 @@ def _start_status_server(agent, port):
         def log_message(self, fmt, *a):
             return
 
-    server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    server = ThreadingHTTPServer((address, port), Handler)
     thread = threading.Thread(target=server.serve_forever, name="orbit-relay-status", daemon=True)
     thread.start()
 
