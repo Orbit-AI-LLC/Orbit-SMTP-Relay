@@ -81,6 +81,9 @@ def cmd_receive(args):
 
     The exit code is the verdict Postfix reads. Zero means the message is safely
     on the durable queue; 75 asks Postfix to try again later; 67 rejects it.
+    While the node is not accepting mail (``postfix_config.accepting_mail``)
+    every message is deferred untouched: nothing is sealed, queued or sent to
+    the server, and Postfix tries again later.
     """
     config = load_config()
     setup_logging(level=config.log_level, backend=config.log_backend, max_entries=config.log_max_entries, path=config.log_path)
@@ -108,6 +111,14 @@ def cmd_receive(args):
     if path is None:
         logger.info("Drop file %s was already claimed.", args.filename)
         return 0
+
+    from .postfix_config import accepting_mail
+
+    if not accepting_mail(config):
+        # Postfix keeps its own copy and pipes it again on a retry.
+        maildrop.discard(path)
+        logger.warning("Not accepting mail; deferring %s.", args.filename)
+        return 75  # EX_TEMPFAIL
 
     try:
         message = maildrop.process_file(path)
@@ -142,10 +153,12 @@ def _queue_for(config):
 
 
 def cmd_status(args):
+    from .postfix_config import accepting_mail
+
     config = load_config()
     queue = _queue_for(config)
     print(json.dumps({"node": config.node_name, "server": config.server_url, "has_api_key": config.has_api_key,
-                      "encryption": _encryption_summary(config),
+                      "accepting_mail": accepting_mail(config), "encryption": _encryption_summary(config),
                       "queue": queue.stats(), "queue_bytes": queue.total_bytes()}, indent=2))
     return 0
 

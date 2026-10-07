@@ -25,6 +25,7 @@ import threading
 import time
 import urllib.request
 
+from . import bounce
 from .config import load_config
 from .crypto import EncryptionError, load_cipher
 from .keys import PublicKeyDirectory
@@ -60,6 +61,7 @@ class RelayAgent:
             backoff_max=self.config.backoff_max,
             backoff_jitter=self.config.backoff_jitter,
         )
+        self.queue.on_exhausted = self.expired
         self.queue.ensure_dirs()
 
         # Raises EncryptionError when the node has no key: there is no
@@ -91,6 +93,7 @@ class RelayAgent:
             "delivered": 0,
             "failed": 0,
             "parked": 0,
+            "bounced": 0,
             "sent": 0,
             "send_failed": 0,
             "last_error": "",
@@ -195,8 +198,11 @@ class RelayAgent:
                 self.stats["last_error"] = str(error)
             return
         except PermanentError as error:
-            logger.error("Rejecting %s -> %s: %s", message.id, message.recipient, error)
-            self.queue.move_to_dead(message, str(error))
+            # Postfix accepted this long ago, so the sender hears of the
+            # refusal from here or not at all. The message is kept as well.
+            outcome = self.notify_sender(message, error)
+            logger.error("Rejecting %s -> %s: %s (%s)", message.id, message.recipient, error, outcome)
+            self.queue.move_to_dead(message, f"{error}; {outcome}")
             with self._lock:
                 self.stats["parked"] += 1
                 self.stats["last_error"] = str(error)
@@ -205,6 +211,30 @@ class RelayAgent:
         with self._lock:
             self.stats["delivered"] += 1
         logger.info("Delivered %s -> %s (thread %s)", message.id, message.recipient, (result or {}).get("thread_id", "-"))
+
+    def notify_sender(self, message, error, status=None):
+        """Send the sender a delivery status notification for a message the
+        server refused for good. Returns what happened, in a few words."""
+        if not bounce.should_bounce(message.envelope_from):
+            return "not bounced: no sender to tell"
+        status = status or bounce.status_for(error)
+        raw = bounce.build(message, str(error), status=status, hostname=self.config.hostname)
+        status, detail = self.sender.bounce(message.envelope_from, raw)
+        if status != "sent":
+            logger.error("Could not bounce %s to %s: %s", message.id, message.envelope_from, detail)
+            return f"bounce not sent: {detail}"
+        with self._lock:
+            self.stats["bounced"] += 1
+        return f"bounced to {message.envelope_from}"
+
+    def expired(self, message):
+        """A message that ran out of retries: its sender hears, as Postfix
+        would tell them. Never raises; the message is parked either way."""
+        try:
+            return self.notify_sender(message, message.last_error or "retries exhausted", status=bounce.EXPIRED)
+        except Exception:
+            logger.exception("Could not bounce expired %s", message.id)
+            return "bounce not sent"
 
     # --- Control loop -----------------------------------------------------
 
@@ -266,7 +296,9 @@ class RelayAgent:
             if self.recipient_count != previous:
                 logger.info("Deliverable addresses: %d -> %d across %d domain(s)", previous, self.recipient_count, len(self.domains))
         try:
-            self.tables.apply(payload)
+            # The receive hook defers mail while the switch is off; it reads
+            # what is written here (``postfix_config.accepting_mail``).
+            self.tables.apply(payload, accepting=self.accepting_mail)
         except Exception:
             # The old digest stays, so the next heartbeat is sent the full
             # lists again instead of being told nothing changed.

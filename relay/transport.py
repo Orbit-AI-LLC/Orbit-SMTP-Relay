@@ -9,8 +9,10 @@ treats them differently:
 
 * **Retryable**: timeout, connection refused, 5xx, 429, and 401 (the API key
   may have been rotated and the node not yet updated; the mail must wait).
-* **Permanent**: other 4xx, or a response that says ``retryable: false``.
-  Retrying forever would fill the disk with mail that can never be delivered.
+* **Permanent**: other 4xx, or a response that says ``retryable: false``,
+  such as ``413`` for a message over the server's limit. Retrying forever
+  would fill the disk with mail that can never be delivered; the agent parks
+  the message and bounces it to the sender (``relay/bounce.py``).
 """
 
 from __future__ import annotations

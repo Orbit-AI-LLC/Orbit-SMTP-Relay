@@ -179,14 +179,16 @@ class Maildrop:
         headers it adds, which is more reliable than trusting the visible
         ``To:``, since that header can list several addresses or none at all.
         """
-        envelope_from = (parsed.get("Return-Path") or "").strip().lstrip("<").rstrip(">")
-        if not envelope_from:
+        return_path = parsed.get("Return-Path")
+        envelope_from = (return_path or "").strip().lstrip("<").rstrip(">")
+        if return_path is None:
             # Postfix normally adds Return-Path, but a message assembled
             # elsewhere (or one this agent re-reads from disk) may lack it.
             # Falling back to From: is a guess about the envelope sender, and a
             # bounce computed from it could misdirect a reply, so this is
             # recorded as the best available value rather than treated as
-            # authoritative.
+            # authoritative. ``Return-Path: <>`` is no such case: it is the
+            # null sender of a bounce or an auto-reply, which is never bounced.
             envelope_from = (email.utils.parseaddr(str(parsed.get("From") or ""))[1] or "").strip()
 
         recipients = []

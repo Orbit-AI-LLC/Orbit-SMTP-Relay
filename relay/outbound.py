@@ -60,10 +60,22 @@ class Sender:
             return "failed", "No valid recipients."
         if not envelope_from or "@" not in envelope_from or envelope_from.startswith("-"):
             return "failed", "Invalid envelope sender."
+        return self._run([self.sendmail_path, "-i", "-f", envelope_from, "--", *recipients], raw)
+
+    def bounce(self, recipient, raw):
+        """Hand a delivery status notification to the local MTA.
+
+        Sent from the null envelope sender (``<>``), so a notification that
+        cannot be delivered is dropped by the MTA instead of bouncing back.
+        Returns ``(status, error)`` like :meth:`send`.
+        """
+        if not recipient or "@" not in recipient or recipient.startswith("-"):
+            return "failed", "Invalid recipient for a delivery status notification."
+        return self._run([self.sendmail_path, "-i", "-f", "<>", "--", recipient], raw)
+
+    def _run(self, command, raw):
         if not self.available():
             return "deferred", f"sendmail is not available at {self.sendmail_path}."
-
-        command = [self.sendmail_path, "-i", "-f", envelope_from, "--", *recipients]
         try:
             completed = subprocess.run(
                 command, input=raw, capture_output=True, timeout=self.timeout, check=False

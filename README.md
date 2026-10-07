@@ -168,8 +168,25 @@ the tables the agent downloaded, hands it to `orbit-relay receive`, which
 seals it to the reader's key and writes it to the durable queue before
 answering Postfix. The delivery worker
 posts queued messages to the server and retries with exponential, jittered
-backoff. A message the server rejects for good (no such mailbox) is parked in
-`dead/`; nothing is ever discarded silently.
+backoff. A message the server refuses for good (`retryable: false`: over its
+size limit, a mailbox removed since the tables were written) is bounced: the
+agent sends the envelope sender a delivery status notification through
+Postfix, from `MAILER-DAEMON` and the null sender, with the message's
+readable headers (the body is sealed), as Postfix would for mail it cannot
+deliver. Mail that came from the null sender, a bounce itself, is never
+bounced. Either way the message is kept in `dead/`, with what happened in its
+`last_error`; nothing is ever discarded silently.
+
+**Pausing.** While the node is not accepting mail, `orbit-relay receive`
+defers every message (exit 75) without sealing, queueing or posting it, and
+removes the drop file; Postfix keeps the message in its own queue, tries the
+hook again later, and bounces it after three days (`maximal_queue_lifetime`).
+A node stops accepting when `ORBIT_ACCEPTING_MAIL=0` is set in
+`/etc/orbit-mail/relay.env`, which the hook reads for every message, or when
+the server's `accepting_mail` is false (Mission Control's switch that pauses
+the fleet; never set for a user key's own relay), which the agent writes to
+`/etc/postfix/orbit/accepting` on every heartbeat. The agent keeps delivering
+what is already queued and keeps sending outgoing mail.
 
 **Configuration.** Every heartbeat sends the node's status (queue depth,
 version, its key id and public key, last error) and receives the domains,
@@ -188,7 +205,7 @@ Postfix through `sendmail -f <sender> <recipients>`, and reports `sent`,
 ```
 /var/lib/orbit-mail/queue/pending/     ready to send to the server
 /var/lib/orbit-mail/queue/inflight/    being sent right now
-/var/lib/orbit-mail/queue/dead/        gave up; kept for inspection
+/var/lib/orbit-mail/queue/dead/        gave up (and bounced, if the server refused it); kept for inspection
 ```
 
 Logs go to the journal. The agent also keeps a bounded in-memory ring of
@@ -201,7 +218,7 @@ endpoint.
 curl -s http://127.0.0.1:8080/status | python3 -m json.tool   # queue, server reachability, encryption, counters
 curl -s http://127.0.0.1:8080/logs | python3 -m json.tool     # the agent's recent events
 sudo orbit-relay ping                  # contact the server once
-sudo orbit-relay status                # queue depth
+sudo orbit-relay status                # queue depth, and whether the node accepts mail
 sudo orbit-relay dead                  # parked messages
 systemctl status orbit-relay postfix   # both services
 journalctl -u orbit-relay -f           # the agent's log
@@ -256,7 +273,7 @@ of the installer.
 |---|---|---|
 | `ORBIT_MAIL_SERVER_URL` | `http://localhost:8100` | The Orbit Mail server. |
 | `ORBIT_RELAY_API_KEY` | (none) | Your own key from Settings, Encryption, or the fleet key from Mission Control. Without it mail queues locally. |
-| `ORBIT_RELAY_NAME` | hostname | Node name shown under Relays in Orbit Mail and on Mission Control's Mail page. |
+| `ORBIT_RELAY_NAME` | hostname | Node name shown under Relays in Orbit Mail and on Mission Control's Mail page. The server tells nodes apart by API key owner and name, so it need only be unique among one key's nodes; another person's relay may have the same name. |
 | `ORBIT_RELAY_HOSTNAME` | FQDN | EHLO name; should match the MX record. |
 | `ORBIT_RELAY_ENCRYPTION_KEY_FILE` | `/etc/orbit-mail/relay.key` | The node's `orbp_...` private key. Required; the node does not start without one. |
 | `ORBIT_RELAY_ENCRYPTION_KEY` | (none) | The key itself, for environments without a file. The file is preferred. |
@@ -270,7 +287,8 @@ of the installer.
 | `ORBIT_STATUS_PORT` | `8080` | The status endpoint's port; `0` turns it off. |
 | `ORBIT_STATUS_ADDRESS` | `127.0.0.1` | Where it listens. It is unauthenticated; keep it on loopback. |
 | `ORBIT_CONFIG_FILE` | `/etc/orbit-mail/relay.env` | The settings file itself; blank reads none. |
-| `ORBIT_MAX_RETRY_HOURS` | `72` | Before an inbound message is parked. |
+| `ORBIT_MAX_RETRY_HOURS` | `72` | Before an inbound message is parked and bounced to its sender (status 4.4.7). |
+| `ORBIT_ACCEPTING_MAIL` | `1` | `0` takes the node out of service: inbound mail is deferred and waits in Postfix's queue (see *Pausing*). Read by the receive hook for every message, so no restart is needed. |
 | `ORBIT_BACKOFF_BASE` / `_MAX` | `5` / `300` | Retry backoff, seconds. |
 | `ORBIT_LOG_BACKEND` | `memory` | `memory` or `file`. |
 | `ORBIT_VERIFY_TLS` | `1` | Set `0` only against a local self-signed server. |
@@ -307,8 +325,10 @@ python3 -m unittest discover -s tests
 The tests cover the queue's crash-safety and retry policy, the
 retryable/permanent classification of server responses, the Postfix to seal
 to queue to server path, the key directory's caching and deferrals, the
-heartbeat's table writing, the outbound claim to sendmail to report path,
-and the encryption format against the primitives the browser uses.
+heartbeat's table writing and the accepting switch the receive hook obeys,
+the bounce for mail the server refuses for good, the outbound claim to
+sendmail to report path, and the encryption format against the primitives
+the browser uses.
 
 To run the agent against a local Orbit Mail server on port 8100, with
 everything it writes kept under `dev/`:

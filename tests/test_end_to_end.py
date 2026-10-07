@@ -240,10 +240,13 @@ class ReceiveHookTests(unittest.TestCase):
         self.keys = PublicKeyDirectory(None, os.path.join(root, "state", "keys"))
         self.reader = Cipher.from_text(generate_key())
         # Nothing listens on port 9: the keys come from the cache or not at all.
+        self.postfix_dir = os.path.join(root, "postfix")
         self.env = dict(os.environ, ORBIT_CONFIG_FILE="", ORBIT_MAIL_SERVER_URL="http://127.0.0.1:9",
                         ORBIT_RELAY_API_KEY="orbk_test", ORBIT_RELAY_ENCRYPTION_KEY=generate_key(),
                         ORBIT_QUEUE_DIR=self.queue.root, ORBIT_MAILDROP_DIR=self.maildrop_dir,
-                        ORBIT_STATE_DIR=os.path.join(root, "state"), ORBIT_LOG_LEVEL="ERROR")
+                        ORBIT_STATE_DIR=os.path.join(root, "state"), ORBIT_POSTFIX_DIR=self.postfix_dir,
+                        ORBIT_LOG_LEVEL="ERROR")
+        self.env.pop("ORBIT_ACCEPTING_MAIL", None)
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -282,6 +285,26 @@ class ReceiveHookTests(unittest.TestCase):
         self.assertEqual({m.recipient for m in queued}, {"alice@example.com"})
         subjects = {self.reader.open(m.encryption, m.raw).split(b"Subject: ")[1].split(b"\n")[0] for m in queued}
         self.assertEqual(subjects, {f"Lunch {i}".encode() for i in range(8)})
+
+    def drop_files(self):
+        return [name for _, _, names in os.walk(self.maildrop_dir) for name in names]
+
+    def test_a_node_the_server_paused_defers_every_message(self):
+        # The reader's key is at hand, so only the switch can defer it.
+        self.set_key()
+        PostfixTables(self.postfix_dir).set_accepting(False)
+        self.assertEqual(self.start().wait(), 75)
+        # Nothing sealed, queued or kept: Postfix holds the message and retries.
+        self.assertEqual((self.queued(), self.drop_files()), ([], []))
+        PostfixTables(self.postfix_dir).set_accepting(True)
+        self.assertEqual(self.start().wait(), 0)
+        self.assertEqual([m.recipient for m in self.queued()], ["alice@example.com"])
+
+    def test_the_operators_switch_defers_every_message(self):
+        self.set_key()
+        self.env["ORBIT_ACCEPTING_MAIL"] = "0"
+        self.assertEqual(self.start().wait(), 75)
+        self.assertEqual((self.queued(), self.drop_files()), ([], []))
 
 
 class FakeSendmail:
@@ -462,6 +485,155 @@ class HeartbeatTests(unittest.TestCase):
             with open(calls) as handle:
                 self.assertEqual([line.split(":")[0] for line in handle.read().splitlines()], ["lmdb", "lmdb"])
 
+    def agent(self, **overrides):
+        from relay.agent import RelayAgent
+
+        postfix_dir = os.path.join(self._tmp.name, "postfix")
+        config = make_config(queue_dir=os.path.join(self._tmp.name, "q"), maildrop_dir=os.path.join(self._tmp.name, "m"),
+                             state_dir=os.path.join(self._tmp.name, "s"), postfix_dir=postfix_dir, log_backend="memory",
+                             **overrides)
+        # No postmap or reload: these tests are about the switch, not the tables.
+        absent = os.path.join(self._tmp.name, "absent")
+        agent = RelayAgent(config=config, tables=PostfixTables(postfix_dir, postmap_path=absent, postfix_path=absent))
+        agent.server.http.request = ScriptedServer()
+        return agent
+
+    def test_the_servers_switch_reaches_the_receive_hook_on_every_heartbeat(self):
+        from relay.postfix_config import accepting_mail
+
+        agent = self.agent()
+        full = {"domains": ["example.com"], "recipients": ["ada@example.com"], "config_digest": "abc", "accepting_mail": True}
+        unchanged = {"unchanged": True, "config_digest": "abc"}
+        agent.server.http.request.queue_reply(
+            (200, json.dumps(full)),
+            (200, json.dumps(dict(unchanged, accepting_mail=False))),
+            (200, json.dumps(dict(unchanged, accepting_mail=True))),
+        )
+        agent.heartbeat()
+        self.assertTrue(accepting_mail(agent.config))
+        # The fleet is paused with nothing else changed: the server leaves the
+        # lists out, and the switch must land all the same.
+        agent.heartbeat()
+        self.assertFalse(agent.accepting_mail)
+        self.assertFalse(accepting_mail(agent.config))
+        agent.heartbeat()
+        self.assertTrue(accepting_mail(agent.config))
+
+    def test_the_operators_switch_is_written_too(self):
+        agent = self.agent(accepting_mail=False)
+        agent.server.http.request.queue_reply((200, json.dumps({"domains": [], "config_digest": "abc", "accepting_mail": True})))
+        agent.heartbeat()
+        self.assertFalse(PostfixTables(agent.config.postfix_dir).accepting_flag())
+
+    def test_a_node_accepts_mail_unless_told_otherwise(self):
+        from relay.postfix_config import accepting_mail
+
+        postfix_dir = os.path.join(self._tmp.name, "postfix")
+        # Before the agent has written anything, as on a fresh install.
+        self.assertTrue(accepting_mail(make_config(postfix_dir=postfix_dir)))
+        self.assertFalse(accepting_mail(make_config(postfix_dir=postfix_dir, accepting_mail=False)))
+        PostfixTables(postfix_dir).set_accepting(False)
+        self.assertFalse(accepting_mail(make_config(postfix_dir=postfix_dir)))
+        PostfixTables(postfix_dir).set_accepting(True)
+        self.assertTrue(accepting_mail(make_config(postfix_dir=postfix_dir)))
+
+
+class BounceTests(unittest.TestCase):
+    """A message the server refuses for good goes back to its sender, and is
+    kept in dead/ as well."""
+
+    def setUp(self):
+        from relay.agent import RelayAgent
+
+        self._tmp = tempfile.TemporaryDirectory()
+        root = self._tmp.name
+        self.sendmail = FakeSendmail(root)
+        config = make_config(queue_dir=os.path.join(root, "q"), maildrop_dir=os.path.join(root, "m"),
+                             state_dir=os.path.join(root, "s"), sendmail_path=self.sendmail.path, log_backend="memory")
+        self.agent = RelayAgent(config=config, keys=AnyReader())
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def accept(self, return_path="<bob@example.org>"):
+        drop = os.path.join(self.agent.maildrop.directory, "alice@example.com")
+        with open(drop, "w") as handle:
+            handle.write(f"Return-Path: {return_path}\r\n" + RAW)
+        claimed = self.agent.maildrop.claim("alice@example.com")
+        message = self.agent.maildrop.process_file(claimed)
+        self.agent.maildrop.discard(claimed)
+        return message
+
+    def refuse(self, status, body):
+        """Deliver the queued message to a server that answers ``status``."""
+        answer = body if isinstance(body, bytes) else json.dumps(body).encode()
+        error = urllib.error.HTTPError("https://mail.example.com/api/relay/inbound/", status, "refused", {}, io.BytesIO(answer))
+        with mock.patch("urllib.request.urlopen", side_effect=error):
+            self.agent.deliver_one(self.agent.queue.due()[0])
+        self.assertEqual(self.agent.queue.stats(), {"pending": 0, "inflight": 0, "dead": 1})
+        return self.agent.queue.list_dead()[0]
+
+    def test_a_message_too_large_for_the_server_is_bounced_to_its_sender(self):
+        self.accept()
+        parked = self.refuse(413, {"error": "The request is 80000000 bytes, over the 75147968 this endpoint accepts.",
+                                   "retryable": False, "code": "too_large"})
+        log = self.sendmail.read()
+        # From the null sender, so the notice itself can never bounce back.
+        self.assertIn("-i -f <> -- bob@example.org", log)
+        self.assertIn("Content-Type: multipart/report; report-type=\"delivery-status\"", log)
+        self.assertIn("Final-Recipient: rfc822; alice@example.com", log)
+        self.assertIn("Status: 5.3.4", log)
+        self.assertIn("over the 75147968 this endpoint accepts.", log)
+        # The readable headers come back; the sealed body never could.
+        self.assertIn("Subject: Lunch", log)
+        self.assertNotIn("Noon?", log)
+        self.assertIn("bounced to bob@example.org", parked.last_error)
+        self.assertEqual((self.agent.stats["bounced"], self.agent.stats["parked"]), (1, 1))
+
+    def test_a_proxys_own_413_is_bounced_too(self):
+        self.accept()
+        self.refuse(413, b"<html><body>413 Request Entity Too Large</body></html>")
+        self.assertIn("Status: 5.3.4", self.sendmail.read())
+
+    def test_mail_from_the_null_sender_is_never_bounced(self):
+        message = self.accept(return_path="<>")
+        self.assertEqual(message.envelope_from, "")
+        parked = self.refuse(422, {"error": "not a deliverable mailbox", "retryable": False, "code": "no_mailbox"})
+        self.assertFalse(os.path.exists(self.sendmail.log))
+        self.assertIn("not bounced", parked.last_error)
+
+    def test_a_bounce_that_cannot_be_sent_leaves_the_message_parked(self):
+        self.agent.sender = Sender(os.path.join(self._tmp.name, "missing"))
+        self.accept()
+        parked = self.refuse(422, {"error": "not a deliverable mailbox", "retryable": False, "code": "no_mailbox"})
+        self.assertIn("bounce not sent", parked.last_error)
+        self.assertEqual(self.agent.stats["bounced"], 0)
+
+    def test_a_message_that_runs_out_of_retries_is_bounced_to_its_sender(self):
+        message = self.accept()
+        # One failed attempt is all it may have.
+        self.agent.queue.max_attempts = 1
+        self.agent.queue.mark_inflight(message)
+        self.agent.queue.requeue(message, "HTTP 503: Service Unavailable")
+        self.assertEqual(self.agent.queue.due(now=time.time() + 3600), [])
+        self.assertEqual(self.agent.queue.stats()["dead"], 1)
+        log = self.sendmail.read()
+        self.assertIn("-i -f <> -- bob@example.org", log)
+        self.assertIn("Status: 4.4.7", log)
+        self.assertIn("HTTP 503: Service Unavailable", log)
+        parked = self.agent.queue.list_dead()[0]
+        self.assertIn("retries exhausted; bounced to bob@example.org", parked.last_error)
+
+    def test_status_codes(self):
+        from relay import bounce
+
+        self.assertEqual(bounce.status_for(PermanentError("x", status=413)), "5.3.4")
+        self.assertEqual(bounce.status_for(PermanentError("x", status=404, code="no_mailbox")), "5.1.1")
+        self.assertEqual(bounce.status_for(PermanentError("x", status=400, code="bad_envelope")), "5.0.0")
+        self.assertFalse(bounce.should_bounce("MAILER-DAEMON@example.org"))
+        self.assertFalse(bounce.should_bounce(""))
+        self.assertTrue(bounce.should_bounce("bob@example.org"))
+
 
 class HttpClientTests(unittest.TestCase):
     """How answers from the server, and failures reaching it, are classified."""
@@ -480,6 +652,11 @@ class HttpClientTests(unittest.TestCase):
         with self.assertRaises(PermanentError) as caught:
             self.answer(404, {"error": "not a deliverable mailbox", "retryable": False, "code": "no_mailbox"})
         self.assertEqual((caught.exception.status, caught.exception.code), (404, "no_mailbox"))
+
+    def test_a_message_too_large_is_permanent(self):
+        with self.assertRaises(PermanentError) as caught:
+            self.answer(413, {"error": "over the limit", "retryable": False, "code": "too_large"})
+        self.assertEqual((caught.exception.status, caught.exception.code), (413, "too_large"))
 
     def test_a_connection_cut_off_mid_answer_is_retryable(self):
         with mock.patch("urllib.request.urlopen", side_effect=ssl.SSLEOFError(8, "EOF occurred in violation of protocol")):

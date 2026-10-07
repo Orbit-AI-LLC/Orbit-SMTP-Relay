@@ -139,6 +139,9 @@ class Queue:
         self.backoff_base = backoff_base
         self.backoff_max = backoff_max
         self.backoff_jitter = backoff_jitter
+        #: Called with a message that ran out of retries, before it is parked;
+        #: returns what became of it in a few words (the agent bounces it).
+        self.on_exhausted = None
 
     def ensure_dirs(self):
         for path in (self.pending_dir, self.inflight_dir, self.dead_dir):
@@ -252,7 +255,8 @@ class Queue:
             if message.next_attempt_at > now:
                 continue
             if self._is_exhausted(message):
-                self.move_to_dead(message, "retries exhausted")
+                outcome = self.on_exhausted(message) if self.on_exhausted else ""
+                self.move_to_dead(message, f"retries exhausted; {outcome}" if outcome else "retries exhausted")
                 continue
             ready.append(message)
 
