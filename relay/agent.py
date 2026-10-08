@@ -29,7 +29,7 @@ import urllib.request
 from . import bounce
 from .config import load_config
 from .crypto import EncryptionError, load_cipher
-from .health import CRITICAL, OK, HealthChecker, Streak, failing, report, result
+from .health import CRITICAL, OK, Dropouts, HealthChecker, Streak, failing, report, result
 from .keys import PublicKeyDirectory
 from .outbound import Sender, decode_item
 from .postfix import Maildrop
@@ -107,6 +107,8 @@ class RelayAgent:
         self.delivery_failures = Streak()
         self.sending_failures = Streak()
         self.heartbeat_failures = Streak()
+        # Requests to the server that got no answer at all, from any thread.
+        self.dropouts = Dropouts()
         self.tables_error = ""
         self.health = None
 
@@ -208,6 +210,8 @@ class RelayAgent:
                 self.stats["failed"] += 1
                 self.stats["last_error"] = str(error)
                 self.delivery_failures.failed(error)
+                if not error.answered:
+                    self.dropouts.failed(error)
             return
         except PermanentError as error:
             # Postfix accepted this long ago, so the sender hears of the
@@ -265,6 +269,8 @@ class RelayAgent:
                 self.server_reachable = False
                 with self._lock:
                     self.heartbeat_failures.failed(error)
+                    if not error.answered:
+                        self.dropouts.failed(error)
             except PermanentError as error:
                 logger.error("Heartbeat rejected: %s", error)
                 self.server_reachable = False
@@ -298,7 +304,8 @@ class RelayAgent:
         with self._lock:
             delivery = copy.copy(self.delivery_failures)
             sending = copy.copy(self.sending_failures)
-        self.health = report(self.checker.run(delivery=delivery, sending=sending, tables_error=self.tables_error))
+            dropouts = copy.deepcopy(self.dropouts)
+        self.health = report(self.checker.run(delivery=delivery, dropouts=dropouts, sending=sending, tables_error=self.tables_error))
         return self.health
 
     def local_health(self):
@@ -368,6 +375,9 @@ class RelayAgent:
                 handled = self.send_batch()
             except RetryableError as error:
                 logger.warning("Outbound poll failed: %s", error)
+                if not error.answered:
+                    with self._lock:
+                        self.dropouts.failed(error)
             except PermanentError as error:
                 logger.error("Outbound poll rejected: %s", error)
             except Exception:

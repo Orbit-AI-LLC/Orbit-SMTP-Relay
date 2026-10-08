@@ -21,8 +21,10 @@ from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 from relay import health
-from relay.health import CRITICAL, OK, WARNING, HealthChecker, Streak, certificate_check, failing, postfix_queue_check
+from relay.health import (CRITICAL, OK, WARNING, Dropouts, HealthChecker, Streak, certificate_check, dropouts_check, failing,
+                          postfix_queue_check)
 from relay.queue import Queue, QueuedMessage
+from relay.transport import RetryableError
 
 from test_end_to_end import FakeSendmail, ScriptedServer, make_config
 
@@ -204,6 +206,31 @@ class CheckTests(unittest.TestCase):
         streak.succeeded()
         self.assertEqual(failing("delivery", streak, "delivery", now)["status"], OK)
 
+    def test_dropouts_that_keep_coming_are_a_warning(self):
+        dropouts = Dropouts()
+        now = time.time()
+        self.assertEqual(dropouts_check(dropouts, now)["detail"], "No dropouts in the last 3 hours.")
+
+        # One minute of failures, from any thread, is one dropout.
+        dropouts.failed("Connection failed: [Errno 101] Network is unreachable", now=now - 3000)
+        dropouts.failed("Connection failed: [Errno 101] Network is unreachable", now=now - 2955)
+        once = dropouts_check(dropouts, now)
+        self.assertEqual(once["status"], OK)
+        self.assertIn("Lost Orbit Mail once", once["detail"])
+
+        dropouts.failed("Timed out: The read operation timed out", now=now - 1800)
+        self.assertEqual(dropouts_check(dropouts, now)["status"], OK)
+        dropouts.failed("Connection failed: [Errno -3] Temporary failure in name resolution", now=now - 600)
+        warning = dropouts_check(dropouts, now)
+        self.assertEqual(warning["status"], WARNING)
+        self.assertIn("3 times in the last 3 hours, most recently 10 minutes ago", warning["detail"])
+        self.assertIn("name resolution", warning["detail"])
+
+        # They age out of the window.
+        later = now + health.DROPOUT_WINDOW_SECONDS
+        self.assertEqual(dropouts_check(dropouts, later)["status"], OK)
+        self.assertEqual(dropouts.recent(later), [])
+
     def test_missing_sendmail_is_critical(self):
         from relay.outbound import Sender
 
@@ -314,6 +341,49 @@ class AgentHealthTests(unittest.TestCase):
         self.server.queue_reply((200, json.dumps({"status": "stored"})))
         agent.deliver_one(message)
         self.assertIsNone(agent.delivery_failures.since)
+
+    def run_once(self, agent, loop):
+        """One pass of a worker loop: past its first wait, stopped at the next."""
+        waits = iter([False, True])
+        with mock.patch.object(agent._stop, "wait", side_effect=lambda timeout: next(waits)):
+            loop()
+
+    def test_requests_that_get_no_answer_are_dropouts_the_next_heartbeat_reports(self):
+        agent = self.agent()
+        unreachable = RetryableError("Connection failed: [Errno 101] Network is unreachable")
+
+        # The server answering, even with an error, is not a dropout.
+        self.server.queue_reply((503, "{}"))
+        self.run_once(agent, agent._outbound_loop)
+        self.assertEqual(agent.dropouts.recent(), [])
+
+        # The outbound poll and the heartbeat failing together are one dropout.
+        self.server.queue_reply(unreachable)
+        self.run_once(agent, agent._outbound_loop)
+        self.server.queue_reply(unreachable)
+        self.run_once(agent, agent._control_loop)
+        self.assertEqual(len(agent.dropouts.recent()), 1)
+
+        def twenty_minutes_pass():
+            agent.dropouts.started = [started - 1200 for started in agent.dropouts.started]
+            agent.dropouts.last_failure -= 1200
+
+        twenty_minutes_pass()
+        message = agent.queue.enqueue(QueuedMessage(recipient="ada@example.com", raw="c2VhbGVk", encoding="base64",
+                                                    encryption={"alg": "ECDH-P256-A256GCM", "kid": "k"}, headers="To: ada@example.com\r\n"))
+        self.server.queue_reply(unreachable)
+        agent.deliver_one(message)
+        twenty_minutes_pass()
+        self.server.queue_reply(RetryableError("Connection failed: [Errno -3] Temporary failure in name resolution"))
+        self.run_once(agent, agent._control_loop)
+        self.assertEqual(len(agent.dropouts.recent()), 3)
+
+        self.server.queue_reply((200, json.dumps({"config_digest": "abc"})))
+        agent.heartbeat()
+        connection = by_check(self.server.requests[-1]["payload"]["health"]["checks"])["connection"]
+        self.assertEqual(connection["status"], WARNING)
+        self.assertIn("Lost Orbit Mail 3 times", connection["detail"])
+        self.assertIn("name resolution", connection["detail"])
 
     def test_sendmail_deferring_starts_a_run_and_sending_ends_it(self):
         import base64

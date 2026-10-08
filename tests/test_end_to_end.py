@@ -53,7 +53,8 @@ def make_config(**overrides):
 
 
 class ScriptedServer:
-    """A server whose replies are scripted, one per call."""
+    """A server whose replies are scripted, one per call: ``(status, body)``,
+    or an exception to raise, such as a request that got no answer."""
 
     def __init__(self):
         self.replies = []
@@ -66,9 +67,12 @@ class ScriptedServer:
         self.requests.append({"url": url, "payload": payload, "headers": headers or {}})
         if not self.replies:
             raise AssertionError("No scripted reply left; the client called too many times.")
-        status, body = self.replies.pop(0)
+        reply = self.replies.pop(0)
+        if isinstance(reply, Exception):
+            raise reply
+        status, body = reply
         if status == 401 or status == 429 or status >= 500:
-            raise RetryableError(f"HTTP {status}")
+            raise RetryableError(f"HTTP {status}", status=status)
         if status >= 400:
             raise PermanentError(f"HTTP {status}", status=status)
         return Response(status, body, {})
@@ -662,6 +666,17 @@ class HttpClientTests(unittest.TestCase):
         with mock.patch("urllib.request.urlopen", side_effect=ssl.SSLEOFError(8, "EOF occurred in violation of protocol")):
             with self.assertRaises(RetryableError):
                 HttpClient().request("https://mail.example.com/api/relay/inbound/", payload={})
+
+    def test_an_answer_is_told_apart_from_no_answer_at_all(self):
+        with self.assertRaises(RetryableError) as caught:
+            self.answer(503, {"error": "busy"})
+        self.assertTrue(caught.exception.answered)
+        unreachable = urllib.error.URLError(OSError(101, "Network is unreachable"))
+        with mock.patch("urllib.request.urlopen", side_effect=unreachable):
+            with self.assertRaises(RetryableError) as caught:
+                HttpClient().request("https://mail.example.com/x", method="GET")
+        self.assertFalse(caught.exception.answered)
+        self.assertIn("Network is unreachable", str(caught.exception))
 
 
 class CommandTests(unittest.TestCase):

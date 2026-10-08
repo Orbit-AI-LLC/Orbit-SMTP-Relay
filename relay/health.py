@@ -14,6 +14,8 @@ Each check is ``{check, label, status, detail}``, ``status`` being ``ok``,
 ``postfix_queue``  Postfix's own queue: outgoing mail it cannot hand to the internet (port 25
                    blocked, a blocklisted address), and inbound mail the receive hook deferred
 ``delivery``       inbound mail reaching Orbit Mail, from the delivery worker's run of failures
+``connection``     how often requests to Orbit Mail got no answer at all lately, however briefly:
+                   a host whose network keeps dropping out
 ``sending``        outgoing mail reaching Postfix through sendmail
 ``tables``         the domain and address tables Postfix accepts mail by were written
 ``disk``           free space where the queue lives
@@ -53,6 +55,11 @@ POSTQUEUE_TIMEOUT = 20.0
 #: How long delivery or sending may keep failing before it is a warning, and critical.
 FAILING_WARNING_SECONDS = 10 * 60
 FAILING_CRITICAL_SECONDS = 60 * 60
+#: Times the node may lose Orbit Mail in the window before it is a warning, and
+#: how far apart two failed requests must be to count as two losses.
+DROPOUT_WARNING = 3
+DROPOUT_WINDOW_SECONDS = 3 * 3600
+DROPOUT_GAP_SECONDS = 2 * 60
 #: Free space on the queue's filesystem is low when it is under both a share
 #: of the disk and a size (a large disk with a small share free still has
 #: room for plenty of mail), or under the floor whatever the disk.
@@ -68,6 +75,7 @@ LABELS = {
     "tls": "TLS certificate",
     "postfix_queue": "Postfix queue",
     "delivery": "Delivery to Orbit Mail",
+    "connection": "Connection to Orbit Mail",
     "sending": "Sending",
     "tables": "Postfix tables",
     "disk": "Disk space",
@@ -154,6 +162,54 @@ def failing(check, streak, what, now=None):
     return result(check, OK, f"{what.capitalize()} failing for {_duration(seconds)}, retrying: {streak.error}")
 
 
+class Dropouts:
+    """The times the node lost Orbit Mail: each run of requests that got no
+    answer at all (a timeout, DNS, a connection that would not open), however
+    short.
+
+    A ``Streak`` forgets its run when one request gets through, which hides a
+    host whose network drops out for a minute every twenty: no run is ever ten
+    minutes long, and the heartbeat that would report one is among the
+    requests failing. This remembers each dropout for
+    ``DROPOUT_WINDOW_SECONDS``, so the next heartbeat that gets through says
+    so. Failures from any of the agent's threads less than
+    ``DROPOUT_GAP_SECONDS`` apart are one dropout.
+    """
+
+    def __init__(self):
+        self.started = []
+        self.last_failure = None
+        self.error = ""
+
+    def failed(self, error, now=None):
+        now = now if now is not None else time.time()
+        if self.last_failure is None or now - self.last_failure > DROPOUT_GAP_SECONDS:
+            self.started = self.recent(now) + [now]
+        self.last_failure = now
+        self.error = str(error or "")[:300]
+
+    def recent(self, now=None):
+        """When each dropout in the window began, oldest first."""
+        cutoff = (now if now is not None else time.time()) - DROPOUT_WINDOW_SECONDS
+        return [started for started in self.started if started > cutoff]
+
+
+def dropouts_check(dropouts, now=None):
+    """The ``connection`` check from ``Dropouts``: a warning once the node has
+    lost Orbit Mail ``DROPOUT_WARNING`` times in the window."""
+    now = now if now is not None else time.time()
+    recent = dropouts.recent(now)
+    window = _duration(DROPOUT_WINDOW_SECONDS)
+    if not recent:
+        return result("connection", OK, f"No dropouts in the last {window}.")
+    times = {1: "once", 2: "twice"}.get(len(recent), f"{len(recent)} times")
+    detail = f"Lost Orbit Mail {times} in the last {window}, most recently {_duration(now - recent[-1])} ago: {dropouts.error}"
+    if len(recent) >= DROPOUT_WARNING:
+        return result("connection", WARNING, detail + " No answer came at all, so look at this host's network and DNS;"
+                                                      " mail waits on the node and is retried.")
+    return result("connection", OK, detail)
+
+
 class HealthChecker:
     """The checks that look at the host rather than the agent's own state.
 
@@ -172,7 +228,7 @@ class HealthChecker:
         self.run_command = run
         self.postqueue_path = postqueue_path
 
-    def run(self, *, delivery=None, sending=None, tables_error="", now=None):
+    def run(self, *, delivery=None, dropouts=None, sending=None, tables_error="", now=None):
         """Every check, in the order they are listed above."""
         now = now if now is not None else time.time()
         checks = []
@@ -180,6 +236,7 @@ class HealthChecker:
             self.check_smtp,
             self.check_postfix_queue,
             lambda: [failing("delivery", delivery, "delivery to Orbit Mail", now)] if delivery else [],
+            lambda: [dropouts_check(dropouts, now)] if dropouts else [],
             lambda: self.check_sending(sending, now),
             lambda: self.check_tables(tables_error),
             self.check_disk,

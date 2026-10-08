@@ -38,6 +38,12 @@ class RetryableError(TransportError):
         super().__init__(message)
         self.status = status
 
+    @property
+    def answered(self):
+        """Whether the server answered (with a status) rather than the request
+        getting no answer at all: a timeout, DNS, a refused or broken connection."""
+        return self.status is not None
+
 
 class PermanentError(TransportError):
     """The request will never succeed. Stop retrying."""

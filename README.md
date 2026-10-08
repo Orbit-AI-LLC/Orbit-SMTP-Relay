@@ -276,12 +276,28 @@ node's status is the worst of them.
 | TLS certificate | no STARTTLS; the certificate expires within 14 days | STARTTLS fails; the certificate has expired |
 | Postfix queue | 20 or more messages deferred: outgoing mail Postfix cannot hand on (the commonest reason is shown; a blocked port 25 looks like `Connection timed out`), or inbound mail the receive hook deferred | 200 or more |
 | Delivery to Orbit Mail | posting inbound mail has failed for 10 minutes with no success between | for an hour |
+| Connection to Orbit Mail | Orbit Mail lost 3 or more times in the last 3 hours: requests (heartbeat, outbound poll or delivery) that got no answer at all, each run of them counted once however short | |
 | Sending | sendmail has deferred outgoing mail for 10 minutes | sendmail is missing; or deferring for an hour |
 | Postfix tables | the domain and address tables could not be written, so changes are not picked up | |
 | Disk space | under 10% and under 5 GB free where the queue lives | under 5% and under 1 GB, or under 256 MB |
 | Parked mail | 10 or more messages parked in the last day | |
 | Sender checks | `python3-dkim`, `python3-spf` or dnspython missing | |
 | Accepting mail | paused on the node (`ORBIT_ACCEPTING_MAIL=0`) | |
+
+**Connection to Orbit Mail** catches a host whose network keeps dropping
+out for a minute or so at a time. No single dropout lasts long enough to be a
+warning, or for the server to call the node down (5 minutes without a
+heartbeat), and the heartbeat that would report it is one of the requests
+failing, so the node remembers each one and the next heartbeat that gets
+through reports it. In the journal a dropout is a few `Heartbeat failed` and
+`Outbound poll failed` lines together: `timed out`, `Temporary failure in
+name resolution` or `[Errno 101] Network is unreachable`. When Orbit Mail's
+name has IPv6 addresses as well as IPv4 ones (as it does behind Cloudflare),
+Python reports the error from the last address it tried, so on a host without
+IPv6 that error usually means the IPv4 attempts timed out (about 20 seconds
+each), not that the host has no route. A `ping` that works afterwards does not mean the dropouts have
+stopped; watch with `ping -D -O 1.1.1.1` for longer than the gap between
+them.
 
 A node that stops heartbeating is shown as down by the server; it cannot say
 so itself. On the node, `/health` and `orbit-relay health` add two checks of
