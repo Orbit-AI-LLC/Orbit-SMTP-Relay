@@ -139,6 +139,9 @@ class Config:
     status_address: str = field(default_factory=lambda: _env("ORBIT_STATUS_ADDRESS", "127.0.0.1"))
     #: 0 turns the endpoint off.
     status_port: int = field(default_factory=lambda: _env_int("ORBIT_STATUS_PORT", 8080))
+    #: The port the health check expects Postfix to answer on, on loopback;
+    #: 0 turns that check off (``relay/health.py``).
+    health_smtp_port: int = field(default_factory=lambda: _env_int("ORBIT_HEALTH_SMTP_PORT", 25))
 
     # --- Retry policy -----------------------------------------------------
     max_retry_hours: int = field(default_factory=lambda: _env_int("ORBIT_MAX_RETRY_HOURS", 72))

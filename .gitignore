@@ -6,6 +6,9 @@ build/
 dist/
 queue/
 maildrop/
-.claude/worktrees/
 .DS_Store
 dev/
+
+# Claude Code session state and worktrees; only the shared settings are kept
+.claude/*
+!.claude/settings.json

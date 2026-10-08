@@ -47,7 +47,7 @@ RAW = (
 def make_config(**overrides):
     values = dict(node_name="relay-test", hostname="relay-test.example.com",
                   server_url="https://mail.example.com", api_key="orbk_test", postfix_dir="",
-                  encryption_key=generate_key())
+                  encryption_key=generate_key(), health_smtp_port=0)
     values.update(overrides)
     return Config(**values)
 

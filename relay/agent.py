@@ -17,6 +17,7 @@ Threads are simply cheaper to supervise here.
 
 from __future__ import annotations
 
+import copy
 import logging
 import os
 import signal
@@ -28,6 +29,7 @@ import urllib.request
 from . import bounce
 from .config import load_config
 from .crypto import EncryptionError, load_cipher
+from .health import CRITICAL, OK, HealthChecker, Streak, failing, report, result
 from .keys import PublicKeyDirectory
 from .outbound import Sender, decode_item
 from .postfix import Maildrop
@@ -75,6 +77,7 @@ class RelayAgent:
         self.maildrop = Maildrop(self.config.maildrop_dir, self.queue, self.config.node_name, keys=self.keys)
         self.sender = sender or Sender(self.config.sendmail_path)
         self.tables = tables or PostfixTables(self.config.postfix_dir, db_type=self.config.postfix_db_type)
+        self.checker = HealthChecker(self.config, self.queue, self.sender, self.tables)
 
         self._stop = threading.Event()
         self._threads = []
@@ -99,6 +102,13 @@ class RelayAgent:
             "last_error": "",
             "last_heartbeat": None,
         }
+        # Runs of failures the health checks report (relay/health.py), and
+        # the checks' last result, which /health serves.
+        self.delivery_failures = Streak()
+        self.sending_failures = Streak()
+        self.heartbeat_failures = Streak()
+        self.tables_error = ""
+        self.health = None
 
     # --- Lifecycle --------------------------------------------------------
 
@@ -184,6 +194,7 @@ class RelayAgent:
                         logger.exception("Could not requeue %s", message.id)
                     with self._lock:
                         self.stats["failed"] += 1
+                        self.delivery_failures.failed("internal error")
 
     def deliver_one(self, message):
         if not self.queue.mark_inflight(message):
@@ -196,6 +207,7 @@ class RelayAgent:
             with self._lock:
                 self.stats["failed"] += 1
                 self.stats["last_error"] = str(error)
+                self.delivery_failures.failed(error)
             return
         except PermanentError as error:
             # Postfix accepted this long ago, so the sender hears of the
@@ -206,10 +218,13 @@ class RelayAgent:
             with self._lock:
                 self.stats["parked"] += 1
                 self.stats["last_error"] = str(error)
+                # The server answered: the message was the problem, not the path.
+                self.delivery_failures.succeeded()
             return
         self.queue.complete(message)
         with self._lock:
             self.stats["delivered"] += 1
+            self.delivery_failures.succeeded()
         logger.info("Delivered %s -> %s (thread %s)", message.id, message.recipient, (result or {}).get("thread_id", "-"))
 
     def notify_sender(self, message, error, status=None):
@@ -248,9 +263,13 @@ class RelayAgent:
             except RetryableError as error:
                 logger.warning("Heartbeat failed: %s", error)
                 self.server_reachable = False
+                with self._lock:
+                    self.heartbeat_failures.failed(error)
             except PermanentError as error:
                 logger.error("Heartbeat rejected: %s", error)
                 self.server_reachable = False
+                with self._lock:
+                    self.heartbeat_failures.failed(error)
             except Exception:
                 logger.exception("Unexpected error during heartbeat.")
             if self._stop.wait(self.heartbeat_interval):
@@ -271,7 +290,36 @@ class RelayAgent:
             "accepting_mail": self.config.accepting_mail,
             "encryption_kid": self.cipher.kid,
             "encryption_public_key": self.cipher.public_key_text,
+            "health": self.check_health(),
         }
+
+    def check_health(self):
+        """Run the node's checks (``relay/health.py``) and keep the result for ``/health``."""
+        with self._lock:
+            delivery = copy.copy(self.delivery_failures)
+            sending = copy.copy(self.sending_failures)
+        self.health = report(self.checker.run(delivery=delivery, sending=sending, tables_error=self.tables_error))
+        return self.health
+
+    def local_health(self):
+        """What ``/health`` answers: the last checks, the agent's own threads,
+        and whether it reaches the server, which the heartbeat cannot report."""
+        last = self.health or self.check_health()
+        with self._lock:
+            heartbeat = copy.copy(self.heartbeat_failures)
+        checks = list(last["checks"]) + [self._workers_check(), self._server_check(heartbeat)]
+        return dict(report(checks), checked_at=last["checked_at"])
+
+    def _workers_check(self):
+        stopped = [thread.name for thread in self._threads if not thread.is_alive()]
+        if stopped and not self._stop.is_set():
+            return result("workers", CRITICAL, f"{', '.join(stopped)} stopped; restart the service (systemctl restart orbit-relay).")
+        return result("workers", OK, "Delivering, heartbeating and sending." if self._threads else "Starting.")
+
+    def _server_check(self, streak):
+        if not self.config.has_api_key:
+            return result("server", CRITICAL, "ORBIT_RELAY_API_KEY is not set, so mail queues here and nothing is sent.")
+        return failing("server", streak, "reaching Orbit Mail")
 
     def heartbeat(self):
         """Report liveness and apply any configuration the server sends."""
@@ -279,6 +327,7 @@ class RelayAgent:
         self.server_reachable = True
         with self._lock:
             self.stats["last_heartbeat"] = time.time()
+            self.heartbeat_failures.succeeded()
         self.apply_config(payload)
         return payload
 
@@ -299,11 +348,13 @@ class RelayAgent:
             # The receive hook defers mail while the switch is off; it reads
             # what is written here (``postfix_config.accepting_mail``).
             self.tables.apply(payload, accepting=self.accepting_mail)
-        except Exception:
+        except Exception as error:
             # The old digest stays, so the next heartbeat is sent the full
             # lists again instead of being told nothing changed.
             logger.exception("Could not update the Postfix tables.")
+            self.tables_error = str(error)[:300] or type(error).__name__
             return
+        self.tables_error = ""
         self.config_digest = payload.get("config_digest", self.config_digest)
 
     # --- Outbound ---------------------------------------------------------
@@ -368,6 +419,13 @@ class RelayAgent:
             else:
                 self.stats["send_failed"] += 1
                 self.stats["last_error"] = error
+            if raw is not None:
+                # Only sendmail's answer says whether the way out works; a
+                # message this node cannot open says nothing about it.
+                if status == "deferred":
+                    self.sending_failures.failed(error)
+                else:
+                    self.sending_failures.succeeded()
         if status == "sent":
             logger.info("Sent %s from %s to %s", outbound_id, item.get("envelope_from"), ", ".join(item.get("recipients") or []))
         else:
@@ -404,6 +462,7 @@ class RelayAgent:
             "deliverable_addresses": self.recipient_count,
             "peers": peers,
             "stats": snapshot,
+            "health": self.health,
         }
 
 

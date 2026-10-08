@@ -213,7 +213,8 @@ the fleet; never set for a user key's own relay), which the agent writes to
 what is already queued and keeps sending outgoing mail.
 
 **Configuration.** Every heartbeat sends the node's status (queue depth,
-version, its key id and public key, last error) and receives the domains,
+version, its key id and public key, last error, and its health checks; see
+*Health checks*) and receives the domains,
 deliverable addresses, catch-all domains and fleet settings the node's API
 key may serve: everything for the fleet key, the owner's mailboxes for a
 user key. The agent writes them as Postfix lookup tables only when the
@@ -240,7 +241,9 @@ endpoint.
 
 ```bash
 curl -s http://127.0.0.1:8080/status | python3 -m json.tool   # queue, server reachability, encryption, counters
+curl -s http://127.0.0.1:8080/health | python3 -m json.tool   # the health checks; 503 when one is critical
 curl -s http://127.0.0.1:8080/logs | python3 -m json.tool     # the agent's recent events
+sudo orbit-relay health                # the same checks; exit 1 on a warning, 2 when critical
 sudo orbit-relay ping                  # contact the server once
 sudo orbit-relay status                # queue depth, and whether the node accepts mail
 sudo orbit-relay dead                  # parked messages
@@ -256,6 +259,40 @@ for that one command.
 A growing `pending` count means the server is unreachable or refusing
 messages. A growing `dead` count means something is permanently wrong; look at
 `last_error` there before assuming a transient outage.
+
+### Health checks
+
+Before every heartbeat the agent checks the parts of the node a heartbeat
+alone does not show (`relay/health.py`) and sends what it found with it.
+Orbit Mail keeps the result on the node, and for the fleet passes it to
+Mission Control, which shows it on its Mail page and emails its super admins
+when a node is down, has stopped working properly or reports a problem, and
+again when it recovers. Each check is `ok`, `warning` or `critical`; the
+node's status is the worst of them.
+
+| Check | Warning | Critical |
+| --- | --- | --- |
+| SMTP | | Postfix does not answer on `127.0.0.1:25` with a 220 greeting |
+| TLS certificate | no STARTTLS; the certificate expires within 14 days | STARTTLS fails; the certificate has expired |
+| Postfix queue | 20 or more messages deferred: outgoing mail Postfix cannot hand on (the commonest reason is shown; a blocked port 25 looks like `Connection timed out`), or inbound mail the receive hook deferred | 200 or more |
+| Delivery to Orbit Mail | posting inbound mail has failed for 10 minutes with no success between | for an hour |
+| Sending | sendmail has deferred outgoing mail for 10 minutes | sendmail is missing; or deferring for an hour |
+| Postfix tables | the domain and address tables could not be written, so changes are not picked up | |
+| Disk space | under 10% and under 5 GB free where the queue lives | under 5% and under 1 GB, or under 256 MB |
+| Parked mail | 10 or more messages parked in the last day | |
+| Sender checks | `python3-dkim`, `python3-spf` or dnspython missing | |
+| Accepting mail | paused on the node (`ORBIT_ACCEPTING_MAIL=0`) | |
+
+A node that stops heartbeating is shown as down by the server; it cannot say
+so itself. On the node, `/health` and `orbit-relay health` add two checks of
+their own: **Workers** (critical when the delivery, heartbeat or outbound
+thread has stopped) and **Orbit Mail** (critical without an API key; a
+warning once heartbeats have failed for 10 minutes, critical after an hour). `/health` answers 503
+when a check is critical, so a plain HTTP monitor on the host can watch it;
+`orbit-relay health` asks the running agent and, when it does not answer,
+reports that as critical and runs the host checks itself. The SMTP check
+connects to Postfix once a minute, which Postfix logs as a connection from
+`localhost`; `ORBIT_HEALTH_SMTP_PORT=0` turns it off.
 
 **Updating.** Re-run the install command. It pulls the latest source,
 rewrites the Postfix configuration and restarts both services; the queue in
@@ -310,6 +347,7 @@ of the installer.
 | `ORBIT_POSTFIX_DB_TYPE` | `hash` | Their table type; the installer sets the host Postfix's default. |
 | `ORBIT_STATUS_PORT` | `8080` | The status endpoint's port; `0` turns it off. |
 | `ORBIT_STATUS_ADDRESS` | `127.0.0.1` | Where it listens. It is unauthenticated; keep it on loopback. |
+| `ORBIT_HEALTH_SMTP_PORT` | `25` | The port the health check expects Postfix to answer on, on loopback; `0` turns that check off. |
 | `ORBIT_CONFIG_FILE` | `/etc/orbit-mail/relay.env` | The settings file itself; blank reads none. |
 | `ORBIT_MAX_RETRY_HOURS` | `72` | Before an inbound message is parked and bounced to its sender (status 4.4.7). |
 | `ORBIT_ACCEPTING_MAIL` | `1` | `0` takes the node out of service: inbound mail is deferred and waits in Postfix's queue (see *Pausing*). Read by the receive hook for every message, so no restart is needed. |
@@ -354,8 +392,10 @@ to queue to server path, the key directory's caching and deferrals, the
 heartbeat's table writing and the accepting switch the receive hook obeys,
 the bounce for mail the server refuses for good, the outbound claim to
 sendmail to report path, the encryption format against the primitives
-the browser uses, and the sender checks (DKIM signed and verified for real,
-DNS and SPF stubbed).
+the browser uses, the sender checks (DKIM signed and verified for real,
+DNS and SPF stubbed), and the health checks (Postfix, its queue and the
+disk stood in for) with the heartbeat, `/health` and `orbit-relay health`
+that carry them.
 
 To run the agent against a local Orbit Mail server on port 8100, with
 everything it writes kept under `dev/`:
@@ -369,7 +409,8 @@ python3 -m relay.cli run
 ```
 
 It heartbeats, writes the tables it is sent into `dev/postfix` and claims
-outgoing mail; without Postfix there is no SMTP, so inbound mail is what the
+outgoing mail; without Postfix there is no SMTP (set
+`ORBIT_HEALTH_SMTP_PORT=0` too, or the SMTP check reports it), so inbound mail is what the
 tests and CI's install job cover. CI installs a node on a fresh Ubuntu host
 with `install.sh` and runs `tests/host_smoke.py` against it: a message sent
 over SMTP must come out of the queue sealed to the reader's key.

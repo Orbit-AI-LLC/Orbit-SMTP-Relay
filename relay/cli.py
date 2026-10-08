@@ -34,6 +34,7 @@ def _build_parser():
     receive.add_argument("filename", help="The dropped file's name, relative to the maildrop directory.")
 
     subparsers.add_parser("status", help="Print queue and agent status as JSON.")
+    subparsers.add_parser("health", help="Print the node's health checks as JSON; exit 1 on a warning, 2 when critical.")
     subparsers.add_parser("check", help="Validate configuration and exit non-zero if unusable.")
     subparsers.add_parser("ping", help="Contact the Orbit Mail server once and print its answer.")
     subparsers.add_parser("logs", help="Print recent in-memory events.")
@@ -59,6 +60,7 @@ def main(argv=None):
         "run": cmd_run,
         "receive": cmd_receive,
         "status": cmd_status,
+        "health": cmd_health,
         "check": cmd_check,
         "ping": cmd_ping,
         "logs": cmd_logs,
@@ -162,6 +164,31 @@ def cmd_status(args):
                       "accepting_mail": accepting_mail(config), "encryption": _encryption_summary(config),
                       "queue": queue.stats(), "queue_bytes": queue.total_bytes()}, indent=2))
     return 0
+
+
+def cmd_health(args):
+    """The node's health checks (``relay/health.py``), as the running agent
+    last ran them, or run here when it does not answer.
+
+    The exit status is for a monitor: 0 healthy, 1 a warning, 2 critical.
+    """
+    from .health import CRITICAL, WARNING, HealthChecker, ask_agent, report, result
+    from .outbound import Sender
+    from .postfix_config import PostfixTables
+
+    config = load_config()
+    address = config.status_address if config.status_address not in ("", "0.0.0.0", "::") else "127.0.0.1"
+    answer = ask_agent(address, config.status_port) if config.status_port else None
+    if answer is None:
+        checker = HealthChecker(config, _queue_for(config), Sender(config.sendmail_path),
+                                PostfixTables(config.postfix_dir, db_type=config.postfix_db_type))
+        checks = checker.run()
+        if config.status_port:
+            checks.insert(0, result("agent", CRITICAL, f"The agent is not answering on {address}:{config.status_port}; "
+                                                       "is it running? (systemctl status orbit-relay)"))
+        answer = report(checks)
+    print(json.dumps(answer, indent=2))
+    return {"ok": 0, WARNING: 1, CRITICAL: 2}.get(answer.get("status"), 2)
 
 
 def _encryption_summary(config):
@@ -268,7 +295,10 @@ def _start_status_server(agent, address, port):
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):  # noqa: N802
             if self.path.startswith("/health"):
-                self._send(200, {"status": "ok"})
+                # The node's checks (relay/health.py); 503 when one is
+                # critical, so a plain HTTP monitor can watch the node.
+                health = agent.local_health()
+                self._send(503 if health["status"] == "critical" else 200, health)
             elif self.path.startswith("/status"):
                 self._send(200, agent.status())
             elif self.path.startswith("/logs"):
@@ -290,6 +320,7 @@ def _start_status_server(agent, address, port):
     server = ThreadingHTTPServer((address, port), Handler)
     thread = threading.Thread(target=server.serve_forever, name="orbit-relay-status", daemon=True)
     thread.start()
+    return server
 
 
 if __name__ == "__main__":

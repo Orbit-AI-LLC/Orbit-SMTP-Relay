@@ -409,6 +409,27 @@ class Queue:
                 messages.append(message)
         return messages
 
+    def dead_since(self, since):
+        """How many messages were parked at or after ``since`` (a timestamp).
+
+        A parked file is written when it is parked, so its modification time
+        says when; nothing is read.
+        """
+        try:
+            entries = list(os.scandir(self.dead_dir))
+        except OSError:
+            return 0
+        count = 0
+        for entry in entries:
+            if not entry.name.endswith(".json"):
+                continue
+            try:
+                if entry.stat().st_mtime >= since:
+                    count += 1
+            except OSError:
+                continue
+        return count
+
     def total_bytes(self):
         """Approximate on-disk size of queued mail, for the status endpoint."""
         total = 0
