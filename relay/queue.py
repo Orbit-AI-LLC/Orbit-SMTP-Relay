@@ -69,6 +69,9 @@ class QueuedMessage:
     headers: str = ""
     has_attachments: bool = False
     plain_size: int = 0
+    #: What the agent found checking the sender (SPF, DKIM, DMARC and BIMI;
+    #: sender_auth), or empty when it could not check.
+    authentication: dict = field(default_factory=dict)
 
     #: Scheduling state. `next_attempt_at` is an epoch float, kept numeric so
     #: comparison and sorting do not have to parse timestamps.

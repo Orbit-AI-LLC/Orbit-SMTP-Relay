@@ -1,7 +1,9 @@
 """The bridge between Postfix and the agent.
 
-Postfix is left doing what it is good at: SMTP, TLS, SPF, DKIM, connection
-tracking and rate limiting. It hands us a message on disk and expects a verdict.
+Postfix is left doing what it is good at: SMTP, TLS, connection tracking and
+rate limiting. It hands us a message on disk and expects a verdict. Who sent
+it (SPF, DKIM, DMARC) the agent checks itself (``sender_auth``), and only
+reports: it never turns mail away.
 
 The pipeline is a pipe, not a socket:
 
@@ -76,7 +78,7 @@ MAX_MESSAGE_BYTES = 50 * 1024 * 1024
 class Maildrop:
     """Reads messages Postfix has written, and reports delivery verdicts."""
 
-    def __init__(self, directory, queue, node_name="", keys=None):
+    def __init__(self, directory, queue, node_name="", keys=None, sender_check=None):
         if keys is None:
             # There is no readable mode. Refusing here, rather than at the
             # first message, keeps a misconfigured node from accepting mail
@@ -89,6 +91,8 @@ class Maildrop:
         #: Every message is sealed to its reader before it is queued, so the
         #: plaintext never rests on disk and never reaches the server.
         self.keys = keys
+        #: ``sender_auth.SenderCheck``, or None to send no verdict.
+        self.sender_check = sender_check
         self.processing_dir = os.path.join(self.directory, ".processing")
         os.makedirs(self.processing_dir, exist_ok=True)
 
@@ -167,9 +171,21 @@ class Maildrop:
         message.headers = header_block.decode("utf-8", errors="replace")
         message.has_attachments = has_attachments(parsed)
         message.plain_size = size
+        message.authentication = self._authenticate(raw_bytes, parsed, envelope_from)
         # Durability first: Postfix is about to be told this was accepted.
         self.queue.enqueue(message)
         return message
+
+    def _authenticate(self, raw_bytes, parsed, envelope_from):
+        """The sender checks, or {} when they cannot be made: a failure here
+        only costs the message its verdict, never its delivery."""
+        if self.sender_check is None:
+            return {}
+        try:
+            return self.sender_check.check(raw_bytes, parsed, envelope_from) or {}
+        except Exception:
+            logger.exception("Could not check who sent a message; it goes on without a verdict.")
+            return {}
 
     @staticmethod
     def _envelope(parsed, path):

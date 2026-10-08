@@ -1,11 +1,17 @@
 [project]
 name = "orbit-relay"
-version = "3.1.0"
+version = "3.2.0"
 description = "Relay agent that runs SMTP for Orbit Mail: inbound mail to the server, outbound mail from it."
 requires-python = ">=3.11"
 # AES-256-GCM for sealing mail on the node. On a node it comes from the
 # distribution (python3-cryptography, 38 on Debian 12); elsewhere pip installs it.
 dependencies = ["cryptography>=38"]
+
+[project.optional-dependencies]
+# Checking who sent inbound mail (relay/sender_auth.py). On a node they come
+# from the distribution (python3-dkim, python3-spf, publicsuffix); without
+# them the agent sends no verdict and delivers mail as before.
+senders = ["dkimpy>=1.0", "pyspf>=2.0.14", "dnspython>=2.0", "authres"]
 
 [project.scripts]
 orbit-relay = "relay.cli:main"

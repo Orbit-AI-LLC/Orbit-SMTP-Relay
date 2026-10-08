@@ -98,6 +98,7 @@ def cmd_receive(args):
         backoff_jitter=config.backoff_jitter,
     )
     from .postfix import Maildrop
+    from .sender_auth import default_checker
     from .transport import MailServerClient
 
     client = MailServerClient(config)
@@ -105,7 +106,7 @@ def cmd_receive(args):
         client, os.path.join(config.state_dir, "keys"),
         ttl=config.key_cache_seconds, missing_ttl=config.missing_key_cache_seconds,
     )
-    maildrop = Maildrop(config.maildrop_dir, queue, config.node_name, keys=keys)
+    maildrop = Maildrop(config.maildrop_dir, queue, config.node_name, keys=keys, sender_check=default_checker())
 
     path = maildrop.claim(args.filename)
     if path is None:

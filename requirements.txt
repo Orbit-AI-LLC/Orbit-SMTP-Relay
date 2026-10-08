@@ -1,9 +1,17 @@
-# The relay agent has one third-party dependency: cryptography, for the
+# The relay agent needs one third-party package to run: cryptography, for the
 # AES-256-GCM sealing of every message. On a node it comes from the
 # distribution's python3-cryptography package (38 on Debian 12), so a node can
 # be reinstalled years from now without reaching PyPI and still start.
 #
-# Postfix handles TLS, SPF, DKIM and rate limiting; beyond that the agent
-# needs only the standard library to move a file from a directory to an HTTP
-# endpoint and retry it until it lands.
+# Postfix handles TLS and rate limiting; beyond that the agent needs only the
+# standard library to move a file from a directory to an HTTP endpoint and
+# retry it until it lands.
 cryptography>=38
+
+# Checking who sent inbound mail (SPF, DKIM, DMARC, BIMI; relay/sender_auth.py).
+# On a node these are python3-dkim, python3-spf and publicsuffix from the
+# distribution. They only report: without them the agent sends no verdict.
+dkimpy>=1.0
+pyspf>=2.0.14
+dnspython>=2.0
+authres

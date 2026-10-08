@@ -7,14 +7,16 @@ easy to work on:
   can be discussed before the code is written.
 - **No new runtime dependencies.** The agent runs on the Python standard
   library plus `cryptography`, which seals every message. A relay node has to
-  be rebuildable years from now.
+  be rebuildable years from now. The sender checks (`sender_auth.py`) use the
+  distribution's `python3-dkim`, `python3-spf` and `publicsuffix` too, and
+  only report: without them mail flows exactly as before.
 - **No readable mode.** Every message is encrypted on the node before it is
   queued or posted. A change that lets plaintext reach the server, even as an
   option, will not be merged.
 - **Tests run with one command** and need no Postfix or network:
 
   ```bash
-  python3 -m pip install cryptography   # once
+  python3 -m pip install cryptography dkimpy pyspf dnspython authres   # once
   python3 -m unittest discover -s tests
   ```
 

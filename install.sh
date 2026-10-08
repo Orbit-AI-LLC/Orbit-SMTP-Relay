@@ -180,7 +180,7 @@ postfix postfix/main_mailer_type select No configuration
 postfix postfix/mailname string ${RELAY_HOSTNAME}
 EOF
     apt-get update -qq
-    apt-get install -y -qq ca-certificates curl git postfix postfix-lmdb python3 python3-cryptography ssl-cert >/dev/null
+    apt-get install -y -qq ca-certificates curl git postfix postfix-lmdb python3 python3-cryptography python3-dkim python3-spf publicsuffix ssl-cert >/dev/null
     /usr/bin/python3 -c 'import sys; sys.exit(sys.version_info < (3, 11))' \
         || die "The relay needs Python 3.11 or newer; this host has $(/usr/bin/python3 -V 2>&1)."
 }

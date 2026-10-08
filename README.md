@@ -41,8 +41,9 @@ curl -fsSL https://raw.githubusercontent.com/Oribt-AI/Orbit-SMTP-Relay/main/inst
     | sudo bash -s -- --server https://mail.example.com --key orbk_...
 ```
 
-The installer carries no secrets. It installs Postfix, Python and
-`python3-cryptography` with `apt`, clones this repository to
+The installer carries no secrets. It installs Postfix, Python,
+`python3-cryptography` and the libraries that check senders (`python3-dkim`,
+`python3-spf`, `publicsuffix`) with `apt`, clones this repository to
 `/opt/orbit-relay`, creates the `orbitmail` system user, generates the node's
 own encryption key in `/etc/orbit-mail/relay.key`, and writes
 `/etc/orbit-mail/relay.env` with the server URL, node name and API key (both
@@ -176,6 +177,29 @@ readable headers (the body is sealed), as Postfix would for mail it cannot
 deliver. Mail that came from the null sender, a bounce itself, is never
 bounced. Either way the message is kept in `dead/`, with what happened in its
 `last_error`; nothing is ever discarded silently.
+
+**Checking senders.** Before sealing a message, `orbit-relay receive` checks
+who sent it (`relay/sender_auth.py`) and sends the server the verdict as
+`authentication` beside the ciphertext. Postfix does not check SPF, DKIM or
+DMARC, and anything a message says about itself (an `Authentication-Results`
+header) was written before it got here, so the agent works from what it can
+trust: the connecting IP and HELO name in the `Received` line our Postfix put
+on top, the envelope sender in the `Return-Path` its pipe added, and the
+message exactly as it arrived.
+
+| Field | What it holds |
+| --- | --- |
+| `from_domain` | The domain of the one `From:` address ("" when there is not exactly one) |
+| `spf`, `spf_domain` | SPF for the envelope sender's domain (the HELO name for a bounce): `pass`, `fail`, `softfail`, `neutral`, `none`, `temperror`, `permerror` |
+| `dkim` | Each signature, up to five: `[{domain, result}]`, `result` being `pass` or `fail` |
+| `dmarc`, `dmarc_policy` | `pass` when a passing signature or SPF is aligned with `from_domain` (relaxed or strict, as its DMARC record says; organizational domains from the public suffix list), `fail` when not, `none` without a record, `temperror` when DNS did not answer; and the policy that applies (`none`, `quarantine`, `reject`) |
+| `bimi` | Only after a DMARC pass under `quarantine` or `reject` on all mail (`pct` 100, and the organization's policy for subdomains enforcing too): `{domain, location, authority}` from `default._bimi.<domain>` (else the organization's), `location` being the logo's `https` address |
+
+The checks only report: a message that fails them is delivered all the same,
+and one that cannot be checked (a DNS timeout, a node without the libraries)
+goes without that part of the verdict, or without one at all. They use the
+distribution's `python3-dkim`, `python3-spf` and `publicsuffix`, which the
+installer adds. Orbit Mail shows a sender's BIMI logo from this verdict.
 
 **Pausing.** While the node is not accepting mail, `orbit-relay receive`
 defers every message (exit 75) without sealing, queueing or posting it, and
@@ -315,10 +339,12 @@ The installer is the reference: each step is a short, commented function in
 
 ## Development
 
-The agent has one third-party dependency, `cryptography`, for the sealing.
+The agent needs `cryptography`, for the sealing. Checking senders uses
+`dkimpy`, `pyspf` and `dnspython` as well (the `senders` extra); without
+them the agent runs and sends no verdict, and their tests are skipped.
 
 ```bash
-python3 -m pip install cryptography
+python3 -m pip install cryptography dkimpy pyspf dnspython authres
 python3 -m unittest discover -s tests
 ```
 
@@ -327,8 +353,9 @@ retryable/permanent classification of server responses, the Postfix to seal
 to queue to server path, the key directory's caching and deferrals, the
 heartbeat's table writing and the accepting switch the receive hook obeys,
 the bounce for mail the server refuses for good, the outbound claim to
-sendmail to report path, and the encryption format against the primitives
-the browser uses.
+sendmail to report path, the encryption format against the primitives
+the browser uses, and the sender checks (DKIM signed and verified for real,
+DNS and SPF stubbed).
 
 To run the agent against a local Orbit Mail server on port 8100, with
 everything it writes kept under `dev/`:

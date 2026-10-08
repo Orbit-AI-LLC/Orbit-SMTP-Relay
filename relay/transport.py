@@ -158,6 +158,8 @@ class MailServerClient:
             "has_attachments": bool(message.has_attachments),
             "size": int(message.plain_size or 0),
         }
+        if message.authentication:
+            payload["authentication"] = dict(message.authentication)
         response = self.http.request(self._url(self.config.inbound_path), payload=payload, headers=self._headers())
         body = response.json()
         if body.get("retryable") is False:
